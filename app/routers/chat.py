@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.evaluators.cheap import run_cheap_tier
+from app.evaluators.medium import run_medium_tier
 from app.model_client import ModelCallError, call_model
 from app.models import EvaluatorTier, Execution, Finding, Session, Workload
 from app.redis_client import get_ledger, set_ledger
@@ -90,7 +91,7 @@ async def chat_completions(
     db.add(execution)
     await db.flush()
 
-    blocked = await _run_response_side_interception(db, session, execution, parsed)
+    blocked = await _run_response_side_interception(db, session, execution, parsed, workload, request)
     if blocked is not None:
         blocked.headers["X-Workload-Id"] = str(workload.workload_id)
         blocked.headers["X-Session-Id"] = str(session.session_id)
@@ -235,6 +236,8 @@ async def _run_response_side_interception(
     session: Session,
     execution: Execution,
     parsed: ChatCompletionResponse,
+    workload: Workload,
+    request: ChatCompletionRequest,
 ) -> JSONResponse | None:
     """Cheap-tier PII/prompt-injection scan on the model's response, per
     forks.md Fork #4 ("input and output are NOT treated differently").
@@ -245,9 +248,22 @@ async def _run_response_side_interception(
     violation -> persist Finding rows, set execution_risk_score to the max
     confidence, update the Redis ledger (Fork #3 math), and return the 403
     to send instead of releasing the response.
+
+    When cheap tier is clean, 2.4's medium tier runs next (per Fork #4,
+    "if cheap tier is inconclusive -> run medium tier"; cheap tier has no
+    graded state, so "inconclusive" is read as "found nothing" here - see
+    .agents/prompts/2.4-medium-embedding-stub-plan.md). It is currently a
+    stub (real detection deferred to 2.5) that always returns no finding,
+    so this call site is exercised on every clean response but never
+    changes behavior today.
     """
     response_text = parsed.choices[0].message.content
     candidates = run_cheap_tier(response_text)
+
+    if not candidates:
+        context_text = "\n".join(message.content for message in request.messages)
+        budget_remaining_ms = workload.latency_budget_ms
+        candidates = run_medium_tier(context_text, response_text, budget_remaining_ms)
 
     if not candidates:
         execution.execution_risk_score = 0.0
