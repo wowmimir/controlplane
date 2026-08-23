@@ -14,7 +14,14 @@ from app.models import FindingCategory
 
 _PATTERNS = {
     "email": re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
-    "phone": re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
+    # Every separator used to be optional, so this reduced to "any 10
+    # consecutive digits" and flagged order ids, byte counts, etc. Now
+    # requires a parenthesized area code or a separator right after it, so
+    # a bare digit run no longer matches. Remaining false positives (a
+    # dot-separated version string, space-grouped digits) are 2.1's job.
+    "phone": re.compile(
+        r"(?<!\d)(?:\+?1[-.\s])?(?:\(\d{3}\)|\d{3}[-.\s])[-.\s]?\d{3}[-.\s]?\d{4}(?!\d)"
+    ),
     "ssn": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
 }
 
