@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from app import models  # noqa: F401  registers every model on Base.metadata
 from app.db import Base, engine
 from app.redis_client import redis_client
+from app.routers.chat import router as chat_router
 from app.seed import seed_default_workload
 
 
@@ -23,6 +24,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ControlPlane.ai", lifespan=lifespan)
+app.include_router(chat_router)
 
 
 @app.get("/health")
