@@ -10,12 +10,14 @@ from fastapi import FastAPI
 from app import models  # noqa: F401  registers every model on Base.metadata
 from app.db import Base, engine
 from app.redis_client import redis_client
+from app.seed import seed_default_workload
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await seed_default_workload()
     await redis_client.ping()
     yield
 
