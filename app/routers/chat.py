@@ -81,9 +81,26 @@ async def chat_completions(
         blocked.headers["X-Session-Id"] = str(session.session_id)
         return blocked
 
+    call_start = time.perf_counter()
     try:
         parsed, latency_ms = await call_model(request)
     except ModelCallError as exc:
+        # 4.2: an attempted-but-failed model call still gets an audit trail
+        # row - tokens/execution_risk_score stay None (no usable response),
+        # latency_ms is elapsed wall-clock time up to the failure. Without
+        # this, a request-side-clean request whose model call then fails
+        # left zero Postgres rows. See
+        # .agents/prompts/4.2-execution-persistence-plan.md.
+        failed_execution = Execution(
+            session_id=session.session_id,
+            workload_id=workload.workload_id,
+            latency_ms=round((time.perf_counter() - call_start) * 1000),
+            retries=0,
+            tool_loop_count=0,
+        )
+        db.add(failed_execution)
+        await db.commit()
+
         error_response = _model_error_response(exc)
         error_response.headers["X-Workload-Id"] = str(workload.workload_id)
         error_response.headers["X-Session-Id"] = str(session.session_id)
@@ -261,6 +278,31 @@ def _escalation_block_response() -> JSONResponse:
     )
 
 
+async def _sync_session_ledger(db: AsyncSession, session: Session, ledger: dict) -> None:
+    """4.3: mirror the Redis ledger's cumulative_risk/strikes into Postgres's
+    Session row (its own schema comment already claims to be "the durable
+    copy of the ledger" - this is what makes that true). Called right after
+    every apply_ledger_update call.
+
+    Deliberately best-effort: wrapped in its own try/except that always
+    logs and swallows, never routed through the workload's fail_mode. A
+    mirror-write failure happens strictly after Redis (and any Finding/
+    Execution rows) already recorded the real decision - letting it flip
+    that decision under fail_open, or 503 an otherwise-clean turn under
+    fail_closed, would be a strictly worse outcome than a stale Postgres
+    value. Ratified with the user. See
+    .agents/prompts/4.3-session-ledger-durability-plan.md.
+    """
+    try:
+        session.cumulative_risk = ledger["cumulative_risk"]
+        session.strikes = ledger["strikes"]
+        await db.commit()
+    except Exception:
+        logger.error(
+            "session ledger Postgres sync failed for session %s", session.session_id, exc_info=True
+        )
+
+
 async def _run_request_side_interception(
     db: AsyncSession, session: Session, workload: Workload, request: ChatCompletionRequest
 ) -> JSONResponse | None:
@@ -286,7 +328,8 @@ async def _run_request_side_interception(
     """
     ledger = await get_ledger(str(session.session_id))
     if is_escalated(ledger):
-        await apply_ledger_update(str(session.session_id), 0.0, [])
+        ledger = await apply_ledger_update(str(session.session_id), 0.0, [])
+        await _sync_session_ledger(db, session, ledger)
         return _escalation_block_response()
 
     text = "\n".join(message.content for message in request.messages)
@@ -315,11 +358,12 @@ async def _run_request_side_interception(
         )
     await db.commit()
 
-    await apply_ledger_update(
+    ledger = await apply_ledger_update(
         str(session.session_id),
         execution_risk_score,
         [(candidate.category.value, candidate.confidence) for candidate in candidates],
     )
+    await _sync_session_ledger(db, session, ledger)
 
     return _policy_block_response("request", candidates)
 
@@ -383,6 +427,7 @@ async def _run_response_side_interception(
 
         ts_anchor = time.time()
         ledger = await apply_ledger_update(str(session.session_id), 0.0, [])
+        await _sync_session_ledger(db, session, ledger)
 
         if is_escalated(ledger):
             return _escalation_block_response()
@@ -408,8 +453,10 @@ async def _run_response_side_interception(
         # .agents/prompts/3.2-escalation-check-plan.md Follow-up - medium
         # tier becoming real will need its own escalation re-check design.
         candidates = medium_candidates
+        tier = EvaluatorTier.medium
     else:
         candidates = cheap_candidates
+        tier = EvaluatorTier.cheap
 
     execution.execution_risk_score = max(candidate.confidence for candidate in candidates)
     for candidate in candidates:
@@ -418,17 +465,18 @@ async def _run_response_side_interception(
                 execution_id=execution.execution_id,
                 category=candidate.category,
                 confidence=candidate.confidence,
-                evaluator_tier=EvaluatorTier.cheap,
+                evaluator_tier=tier,
                 evidence_ref={"side": "response", **(candidate.evidence_ref or {})},
             )
         )
     await db.commit()
 
-    await apply_ledger_update(
+    ledger = await apply_ledger_update(
         str(session.session_id),
         execution.execution_risk_score,
         [(candidate.category.value, candidate.confidence) for candidate in candidates],
     )
+    await _sync_session_ledger(db, session, ledger)
 
     return _policy_block_response("response", candidates)
 
@@ -484,13 +532,20 @@ async def _run_expensive_tier_task(
                 )
             await db.commit()
 
-        await apply_ledger_update(
-            str(session_id),
-            execution.execution_risk_score,
-            [(candidate.category.value, candidate.confidence) for candidate in candidates],
-            is_new_turn=False,
-            turn_anchor=turn_anchor,
-            ts_anchor=ts_anchor,
-        )
+            ledger = await apply_ledger_update(
+                str(session_id),
+                execution.execution_risk_score,
+                [(candidate.category.value, candidate.confidence) for candidate in candidates],
+                is_new_turn=False,
+                turn_anchor=turn_anchor,
+                ts_anchor=ts_anchor,
+            )
+
+            # 4.3: this task never receives a Session ORM object (only a
+            # raw session_id) - fetch it here, inside the same DB scope
+            # already open for the Execution/Finding writes above, rather
+            # than opening a third session.
+            session_row = await db.get(Session, session_id)
+            await _sync_session_ledger(db, session_row, ledger)
     except Exception:
         logger.error("expensive-tier background task failed for execution %s", execution_id, exc_info=True)
