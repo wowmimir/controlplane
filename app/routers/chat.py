@@ -17,8 +17,10 @@ call already happened), writes Finding(s), updates the ledger, and returns
 """
 
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response
 from fastapi.responses import JSONResponse
@@ -28,9 +30,10 @@ from app.db import async_session, get_db
 from app.evaluators.cheap import run_cheap_tier
 from app.evaluators.expensive import run_expensive_tier
 from app.evaluators.medium import run_medium_tier
+from app.evaluators.types import FindingCandidate
 from app.model_client import ModelCallError, call_model
-from app.models import EvaluatorTier, Execution, Finding, Session, Workload
-from app.redis_client import get_ledger, set_ledger
+from app.models import EvaluatorTier, Execution, FailMode, Finding, Session, Workload
+from app.redis_client import apply_ledger_update, get_ledger, is_escalated
 from app.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
 from app.seed import DEFAULT_WORKLOAD_ID
 
@@ -38,8 +41,6 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 SESSION_TTL = timedelta(minutes=15)
-LEDGER_DECAY_FACTOR = 0.7
-STRIKE_THRESHOLD = 0.7
 
 # Caller-facing text per ModelCallError.code - deliberately generic. The
 # real detail (raw upstream error body, MODEL_API_BASE_URL) goes to the
@@ -68,7 +69,13 @@ async def chat_completions(
     response.headers["X-Workload-Id"] = str(workload.workload_id)
     response.headers["X-Session-Id"] = str(session.session_id)
 
-    blocked = await _run_request_side_interception(db, session, workload, request)
+    try:
+        blocked = await _run_request_side_interception(db, session, workload, request)
+    except Exception:
+        logger.error(
+            "request-side interception failed for session %s", session.session_id, exc_info=True
+        )
+        blocked = _internal_error_response() if workload.fail_mode == FailMode.fail_closed else None
     if blocked is not None:
         blocked.headers["X-Workload-Id"] = str(workload.workload_id)
         blocked.headers["X-Session-Id"] = str(session.session_id)
@@ -93,9 +100,15 @@ async def chat_completions(
     db.add(execution)
     await db.flush()
 
-    blocked = await _run_response_side_interception(
-        db, session, execution, parsed, workload, request, background_tasks
-    )
+    try:
+        blocked = await _run_response_side_interception(
+            db, session, execution, parsed, workload, request, background_tasks
+        )
+    except Exception:
+        logger.error(
+            "response-side interception failed for session %s", session.session_id, exc_info=True
+        )
+        blocked = _internal_error_response() if workload.fail_mode == FailMode.fail_closed else None
     if blocked is not None:
         blocked.headers["X-Workload-Id"] = str(workload.workload_id)
         blocked.headers["X-Session-Id"] = str(session.session_id)
@@ -175,15 +188,107 @@ async def _resolve_session(
     return session
 
 
+def _policy_block_response(side: Literal["request", "response"], candidates: list[FindingCandidate]) -> JSONResponse:
+    """The 403 envelope shared by a request-side and a response-side block
+    (forks.md Fork #4: "input and output are NOT treated differently").
+    Extracted in 3.1 to remove the duplication between the two interception
+    functions below; byte-identical output to what each used to build
+    inline, just parameterized by which side triggered it.
+    """
+    primary = max(candidates, key=lambda candidate: candidate.confidence)
+    categories = sorted({candidate.category.value for candidate in candidates})
+    verb, noun = ("Request", "input") if side == "request" else ("Response", "output")
+    return JSONResponse(
+        status_code=403,
+        content={
+            "error": {
+                "message": f"{verb} blocked by ControlPlane: {', '.join(categories)} detected in {noun}.",
+                "type": "controlplane_policy_violation",
+                "param": None,
+                "code": primary.category.value,
+            }
+        },
+    )
+
+
+def _internal_error_response() -> JSONResponse:
+    """A ControlPlane-internal failure (Redis, Postgres, or evaluator code)
+    on a fail_closed workload -> 503. Distinct type/code from
+    _model_error_response (502, the upstream MODEL API failed) and from
+    _policy_block_response/_escalation_block_response (403, a real policy
+    decision was made) - this means ControlPlane itself could not complete
+    its own evaluation. The real exception is logged server-side only (see
+    the call sites in chat_completions); this body is always the same
+    fixed, generic message. See
+    .agents/prompts/3.3-fail-open-fail-closed-handling-plan.md.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "message": "ControlPlane encountered an internal error while evaluating this request.",
+                "type": "controlplane_internal_error",
+                "param": None,
+                "code": "internal_error",
+            }
+        },
+    )
+
+
+def _escalation_block_response() -> JSONResponse:
+    """Session-level block: the ledger's accumulated state (not this turn's
+    own content) tripped Fork #3's escalation condition
+    (cumulative_risk > 0.7 OR any strikes[category] >= 3). Distinct
+    type/code from _policy_block_response so logs/audits and any
+    client-side handling can tell "session in cooldown" apart from "this
+    content was blocked". See
+    .agents/prompts/3.2-escalation-check-plan.md.
+    """
+    return JSONResponse(
+        status_code=403,
+        content={
+            "error": {
+                "message": (
+                    "This session is temporarily blocked: accumulated risk has "
+                    "exceeded ControlPlane's policy threshold. It will clear "
+                    "automatically as recent activity ages out."
+                ),
+                "type": "controlplane_session_escalated",
+                "param": None,
+                "code": "session_escalated",
+            }
+        },
+    )
+
+
 async def _run_request_side_interception(
     db: AsyncSession, session: Session, workload: Workload, request: ChatCompletionRequest
 ) -> JSONResponse | None:
     """Cheap-tier PII/prompt-injection scan on the incoming prompt, per
     forks.md Fork #4. No violation -> None (caller falls through to the
     model path). A violation -> persist Execution + Finding rows, update the
-    Redis ledger (Fork #3 math), and return the 403 to send instead of
-    calling the model.
+    Redis ledger via apply_ledger_update (Fork #3 math, per
+    .agents/prompts/3.1-ledger-update-logic-plan.md), and return the 403 to
+    send instead of calling the model. This is a new turn (is_new_turn
+    defaults to True).
+
+    3.2: before any of that, a read-only peek at the session's CURRENT
+    ledger checks whether it is already escalated from prior turns (Fork
+    #3: cumulative_risk > 0.7 OR any strikes[category] >= 3). If so, this
+    turn's content is never scanned at all (ratified with the user - fail
+    fast, matching the existing cheap-tier philosophy applied one layer
+    earlier) - it blocks immediately, with a single zero-risk decay touch
+    so the session can cool down over subsequent turns. A NOT-escalated
+    session is never touched here (get_ledger, not apply_ledger_update) -
+    the touch only happens on this early-return path, which is that
+    request's sole conclusion, preserving 3.1's one-touch-per-request
+    invariant. See .agents/prompts/3.2-escalation-check-plan.md.
     """
+    ledger = await get_ledger(str(session.session_id))
+    if is_escalated(ledger):
+        await apply_ledger_update(str(session.session_id), 0.0, [])
+        return _escalation_block_response()
+
     text = "\n".join(message.content for message in request.messages)
     candidates = run_cheap_tier(text)
     if not candidates:
@@ -210,29 +315,13 @@ async def _run_request_side_interception(
         )
     await db.commit()
 
-    ledger = await get_ledger(str(session.session_id))
-    ledger["cumulative_risk"] = ledger["cumulative_risk"] * LEDGER_DECAY_FACTOR + execution_risk_score
-    for candidate in candidates:
-        if candidate.confidence > STRIKE_THRESHOLD:
-            ledger["strikes"][candidate.category.value] += 1
-    await set_ledger(str(session.session_id), ledger)
-
-    primary = max(candidates, key=lambda candidate: candidate.confidence)
-    categories = sorted({candidate.category.value for candidate in candidates})
-    return JSONResponse(
-        status_code=403,
-        content={
-            "error": {
-                "message": (
-                    "Request blocked by ControlPlane: "
-                    f"{', '.join(categories)} detected in input."
-                ),
-                "type": "controlplane_policy_violation",
-                "param": None,
-                "code": primary.category.value,
-            }
-        },
+    await apply_ledger_update(
+        str(session.session_id),
+        execution_risk_score,
+        [(candidate.category.value, candidate.confidence) for candidate in candidates],
     )
+
+    return _policy_block_response("request", candidates)
 
 
 async def _run_response_side_interception(
@@ -269,26 +358,58 @@ async def _run_response_side_interception(
     release, since forks.md Fork #4 caps its post-release power at updating
     the ledger/audit trail - it can never block or alter this response. See
     .agents/prompts/2.5-expensive-llm-as-judge-plan.md.
+
+    3.1: this is where a clean turn's ledger touch lives (per
+    .agents/prompts/3.1-ledger-update-logic-plan.md) - the one point in the
+    whole request where a request-side-clean call's turn concludes
+    synchronously, so cumulative_risk decays even when nothing was found.
+    The turn/timestamp that touch produces is threaded into the scheduled
+    background task as turn_anchor/ts_anchor, so if the expensive tier finds
+    something later, that strike is stamped as having happened at THIS
+    turn, not whenever the judge call finishes.
     """
     response_text = parsed.choices[0].message.content
-    candidates = run_cheap_tier(response_text)
+    cheap_candidates = run_cheap_tier(response_text)
 
-    if not candidates:
-        context_text = "\n".join(message.content for message in request.messages)
-        budget_remaining_ms = workload.latency_budget_ms
-        candidates = run_medium_tier(context_text, response_text, budget_remaining_ms)
-
-    if not candidates:
+    if not cheap_candidates:
+        # 3.2: per Fork #4's literal ordering - cheap tier's result feeds
+        # the ledger -> check escalation -> only THEN decide whether medium
+        # tier runs at all. This turn's own content was clean, but the
+        # session's accumulated state might already be over threshold from
+        # prior turns; if so, block here and never reach medium/expensive
+        # tier. See .agents/prompts/3.2-escalation-check-plan.md.
         execution.execution_risk_score = 0.0
         await db.commit()
-        background_tasks.add_task(
-            _run_expensive_tier_task,
-            execution_id=execution.execution_id,
-            session_id=session.session_id,
-            context_text=context_text,
-            response_text=response_text,
-        )
-        return None
+
+        ts_anchor = time.time()
+        ledger = await apply_ledger_update(str(session.session_id), 0.0, [])
+
+        if is_escalated(ledger):
+            return _escalation_block_response()
+
+        context_text = "\n".join(message.content for message in request.messages)
+        budget_remaining_ms = workload.latency_budget_ms
+        medium_candidates = run_medium_tier(context_text, response_text, budget_remaining_ms)
+
+        if not medium_candidates:
+            background_tasks.add_task(
+                _run_expensive_tier_task,
+                execution_id=execution.execution_id,
+                session_id=session.session_id,
+                context_text=context_text,
+                response_text=response_text,
+                turn_anchor=ledger["turn"],
+                ts_anchor=ts_anchor,
+            )
+            return None
+
+        # Medium-tier-violation branch: currently unreachable (2.4's stub
+        # always returns []), kept for structural completeness. See
+        # .agents/prompts/3.2-escalation-check-plan.md Follow-up - medium
+        # tier becoming real will need its own escalation re-check design.
+        candidates = medium_candidates
+    else:
+        candidates = cheap_candidates
 
     execution.execution_risk_score = max(candidate.confidence for candidate in candidates)
     for candidate in candidates:
@@ -303,31 +424,13 @@ async def _run_response_side_interception(
         )
     await db.commit()
 
-    ledger = await get_ledger(str(session.session_id))
-    ledger["cumulative_risk"] = (
-        ledger["cumulative_risk"] * LEDGER_DECAY_FACTOR + execution.execution_risk_score
+    await apply_ledger_update(
+        str(session.session_id),
+        execution.execution_risk_score,
+        [(candidate.category.value, candidate.confidence) for candidate in candidates],
     )
-    for candidate in candidates:
-        if candidate.confidence > STRIKE_THRESHOLD:
-            ledger["strikes"][candidate.category.value] += 1
-    await set_ledger(str(session.session_id), ledger)
 
-    primary = max(candidates, key=lambda candidate: candidate.confidence)
-    categories = sorted({candidate.category.value for candidate in candidates})
-    return JSONResponse(
-        status_code=403,
-        content={
-            "error": {
-                "message": (
-                    "Response blocked by ControlPlane: "
-                    f"{', '.join(categories)} detected in output."
-                ),
-                "type": "controlplane_policy_violation",
-                "param": None,
-                "code": primary.category.value,
-            }
-        },
-    )
+    return _policy_block_response("response", candidates)
 
 
 async def _run_expensive_tier_task(
@@ -335,6 +438,8 @@ async def _run_expensive_tier_task(
     session_id: uuid.UUID,
     context_text: str,
     response_text: str,
+    turn_anchor: int,
+    ts_anchor: float,
 ) -> None:
     """BackgroundTasks entry point for 2.5's LLM-as-judge, scheduled from
     _run_response_side_interception only after the response has already
@@ -349,6 +454,15 @@ async def _run_expensive_tier_task(
     anywhere in this function is caught and logged, never re-raised - there
     is no caller left to report an error to. See
     .agents/prompts/2.5-expensive-llm-as-judge-plan.md.
+
+    3.1: is_new_turn=False always - this task must never advance the
+    ledger's turn counter (it would corrupt the strike window for every
+    later check this session), and any strike it writes is stamped with
+    turn_anchor/ts_anchor (the original request's clean-path touch), not
+    whenever this task happens to finish. This does mean the same turn's
+    cumulative_risk can decay twice (once synchronously at 0.0, once again
+    here for real) - an accepted, self-correcting quirk, not a bug; see
+    .agents/prompts/3.1-ledger-update-logic-plan.md's Rationale.
     """
     try:
         candidates = await run_expensive_tier(context_text, response_text)
@@ -370,13 +484,13 @@ async def _run_expensive_tier_task(
                 )
             await db.commit()
 
-        ledger = await get_ledger(str(session_id))
-        ledger["cumulative_risk"] = (
-            ledger["cumulative_risk"] * LEDGER_DECAY_FACTOR + execution.execution_risk_score
+        await apply_ledger_update(
+            str(session_id),
+            execution.execution_risk_score,
+            [(candidate.category.value, candidate.confidence) for candidate in candidates],
+            is_new_turn=False,
+            turn_anchor=turn_anchor,
+            ts_anchor=ts_anchor,
         )
-        for candidate in candidates:
-            if candidate.confidence > STRIKE_THRESHOLD:
-                ledger["strikes"][candidate.category.value] += 1
-        await set_ledger(str(session_id), ledger)
     except Exception:
         logger.error("expensive-tier background task failed for execution %s", execution_id, exc_info=True)
