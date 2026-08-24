@@ -20,12 +20,13 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import get_db
+from app.db import async_session, get_db
 from app.evaluators.cheap import run_cheap_tier
+from app.evaluators.expensive import run_expensive_tier
 from app.evaluators.medium import run_medium_tier
 from app.model_client import ModelCallError, call_model
 from app.models import EvaluatorTier, Execution, Finding, Session, Workload
@@ -56,6 +57,7 @@ _MODEL_ERROR_MESSAGES = {
 async def chat_completions(
     request: ChatCompletionRequest,
     response: Response,
+    background_tasks: BackgroundTasks,
     x_workload_id: uuid.UUID | None = Header(default=None),
     x_session_id: uuid.UUID | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
@@ -91,7 +93,9 @@ async def chat_completions(
     db.add(execution)
     await db.flush()
 
-    blocked = await _run_response_side_interception(db, session, execution, parsed, workload, request)
+    blocked = await _run_response_side_interception(
+        db, session, execution, parsed, workload, request, background_tasks
+    )
     if blocked is not None:
         blocked.headers["X-Workload-Id"] = str(workload.workload_id)
         blocked.headers["X-Session-Id"] = str(session.session_id)
@@ -238,6 +242,7 @@ async def _run_response_side_interception(
     parsed: ChatCompletionResponse,
     workload: Workload,
     request: ChatCompletionRequest,
+    background_tasks: BackgroundTasks,
 ) -> JSONResponse | None:
     """Cheap-tier PII/prompt-injection scan on the model's response, per
     forks.md Fork #4 ("input and output are NOT treated differently").
@@ -252,10 +257,18 @@ async def _run_response_side_interception(
     When cheap tier is clean, 2.4's medium tier runs next (per Fork #4,
     "if cheap tier is inconclusive -> run medium tier"; cheap tier has no
     graded state, so "inconclusive" is read as "found nothing" here - see
-    .agents/prompts/2.4-medium-embedding-stub-plan.md). It is currently a
-    stub (real detection deferred to 2.5) that always returns no finding,
-    so this call site is exercised on every clean response but never
-    changes behavior today.
+    .agents/prompts/2.4-medium-embedding-stub-plan.md). It is a permanent
+    stub that always returns no finding (real hallucination detection lives
+    in the expensive tier instead, per the 2.4 correction), so every
+    cheap-tier-clean response reaches the branch below.
+
+    2.5: when both tiers are clean, that is 2.5's async trigger condition
+    (STATUS.md: "invoked when medium tier is inconclusive"). The response
+    has already been decided-clean and is about to release; the expensive
+    tier (LLM-as-judge) is scheduled via BackgroundTasks to run *after*
+    release, since forks.md Fork #4 caps its post-release power at updating
+    the ledger/audit trail - it can never block or alter this response. See
+    .agents/prompts/2.5-expensive-llm-as-judge-plan.md.
     """
     response_text = parsed.choices[0].message.content
     candidates = run_cheap_tier(response_text)
@@ -268,6 +281,13 @@ async def _run_response_side_interception(
     if not candidates:
         execution.execution_risk_score = 0.0
         await db.commit()
+        background_tasks.add_task(
+            _run_expensive_tier_task,
+            execution_id=execution.execution_id,
+            session_id=session.session_id,
+            context_text=context_text,
+            response_text=response_text,
+        )
         return None
 
     execution.execution_risk_score = max(candidate.confidence for candidate in candidates)
@@ -308,3 +328,55 @@ async def _run_response_side_interception(
             }
         },
     )
+
+
+async def _run_expensive_tier_task(
+    execution_id: uuid.UUID,
+    session_id: uuid.UUID,
+    context_text: str,
+    response_text: str,
+) -> None:
+    """BackgroundTasks entry point for 2.5's LLM-as-judge, scheduled from
+    _run_response_side_interception only after the response has already
+    been committed and released. Runs on its own DB session (async_session,
+    not the request-scoped Depends(get_db) session, which is already closed
+    by the time BackgroundTasks fires) - per forks.md Fork #4, this can only
+    update the ledger and audit trail, never the response the caller
+    already received.
+
+    A clean verdict (run_expensive_tier returns []) touches nothing, same
+    "clean = no ledger write" precedent 1.3/1.5 already set. Any exception
+    anywhere in this function is caught and logged, never re-raised - there
+    is no caller left to report an error to. See
+    .agents/prompts/2.5-expensive-llm-as-judge-plan.md.
+    """
+    try:
+        candidates = await run_expensive_tier(context_text, response_text)
+        if not candidates:
+            return
+
+        async with async_session() as db:
+            execution = await db.get(Execution, execution_id)
+            execution.execution_risk_score = max(candidate.confidence for candidate in candidates)
+            for candidate in candidates:
+                db.add(
+                    Finding(
+                        execution_id=execution_id,
+                        category=candidate.category,
+                        confidence=candidate.confidence,
+                        evaluator_tier=EvaluatorTier.expensive,
+                        evidence_ref={"side": "response", **(candidate.evidence_ref or {})},
+                    )
+                )
+            await db.commit()
+
+        ledger = await get_ledger(str(session_id))
+        ledger["cumulative_risk"] = (
+            ledger["cumulative_risk"] * LEDGER_DECAY_FACTOR + execution.execution_risk_score
+        )
+        for candidate in candidates:
+            if candidate.confidence > STRIKE_THRESHOLD:
+                ledger["strikes"][candidate.category.value] += 1
+        await set_ledger(str(session_id), ledger)
+    except Exception:
+        logger.error("expensive-tier background task failed for execution %s", execution_id, exc_info=True)
