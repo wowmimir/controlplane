@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { fetchSessionDetail, NotFoundError } from './api'
-import { displayId } from './lib/format'
+import { displayId, isLedgerLive } from './lib/format'
 import type { ExecutionOut, FindingOut, SessionDetail as SessionDetailData } from './types'
 
 type LoadState =
@@ -183,23 +183,34 @@ export function SessionDetail() {
 
         {state.status === 'ready' && (
           <div className="flex flex-col gap-6">
-            {state.data.escalated && (
-              <div
-                role="alert"
-                className="rounded-md border border-[var(--color-error)]/40 bg-[var(--color-surface)] p-4"
-              >
-                <p className="font-medium text-[var(--color-error)]">
-                  This session is escalated
-                </p>
-                <p className="mt-1 text-sm text-[var(--color-muted)]">
-                  Cumulative risk or a per-category strike count crossed Fork #3's threshold, so
-                  new turns on this session block immediately. Escalation itself writes no
-                  execution row, so the turn that tripped it may not be one of the ones listed
-                  below — the story here is the accumulation across turns, not necessarily any
-                  single one of them.
-                </p>
-              </div>
-            )}
+            {state.data.escalated && (() => {
+              // 7.1/M3: cumulative_risk/strikes come from the Postgres
+              // mirror, which never expires - but the Redis ledger that
+              // actually gates traffic has a 15-minute TTL. Once it expires,
+              // "new turns block immediately" is no longer true, so the
+              // banner must say so. See docs/reviews/2026-08-25-phase6.md
+              // Major #3.
+              const ledgerLive = isLedgerLive(state.data.ttl_expires_at)
+              return (
+                <div
+                  role="alert"
+                  className="rounded-md border border-[var(--color-error)]/40 bg-[var(--color-surface)] p-4"
+                >
+                  <p className="font-medium text-[var(--color-error)]">
+                    {ledgerLive ? 'This session is escalated' : 'This session was escalated'}
+                  </p>
+                  <p className="mt-1 text-sm text-[var(--color-muted)]">
+                    Cumulative risk or a per-category strike count crossed Fork #3's threshold.{' '}
+                    {ledgerLive
+                      ? 'New turns on this session block immediately.'
+                      : "The live ledger has since expired (15 minutes of inactivity) — a new turn today would start fresh."}{' '}
+                    Escalation itself writes no execution row, so the turn that tripped it may not
+                    be one of the ones listed below — the story here is the accumulation across
+                    turns, not necessarily any single one of them.
+                  </p>
+                </div>
+              )
+            })()}
 
             <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-6">
               <dl className="flex flex-wrap items-baseline gap-x-8 gap-y-4">

@@ -109,11 +109,19 @@ def scenario_multi_turn_escalation(client: httpx.Client) -> None:
 
 
 def _extract_number(text: str) -> int | None:
-    digits = re.sub(r"[^0-9]", "", text)
-    if not digits:
+    # 7.1/N5: was re.sub(r"[^0-9]", "", text) - concatenated every digit in
+    # the reply, so a reply like "4837 x 6293 = 30438241" (echoing the
+    # inputs before the answer) parsed as 4837629330438241, which could
+    # never equal the correct product. Picks the longest contiguous
+    # (comma-tolerant) digit run instead, since the real answer is reliably
+    # the longest number in the reply (an 8-digit product vs. 4-digit
+    # inputs). See docs/reviews/2026-08-25-phase6.md Minor,
+    # _extract_number concatenates every digit in the reply.
+    matches = re.findall(r"\d[\d,]*\d|\d", text)
+    if not matches:
         return None
     try:
-        return int(digits)
+        return int(max(matches, key=len).replace(",", ""))
     except ValueError:
         return None
 
@@ -205,11 +213,20 @@ def parse_args() -> argparse.Namespace:
         default="http://localhost:8000",
         help="Base URL of a running ControlPlane instance (default: http://localhost:8000)",
     )
+    parser.add_argument(
+        "--model",
+        default=MODEL,
+        help=f"Model name to send in each request (default: {MODEL!r}). "
+        "README.md invites pointing MODEL_API_BASE_URL at any OpenAI-compatible "
+        "provider - without this flag, every scenario failed against one with a 502.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    global MODEL
+    MODEL = args.model
     client = httpx.Client(base_url=args.base_url, timeout=150.0)
 
     results = [

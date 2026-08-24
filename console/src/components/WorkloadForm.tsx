@@ -55,11 +55,23 @@ export function WorkloadForm({ open, workload, onClose, onSaved }: WorkloadFormP
     }
   }, [open])
 
-  function buildMetadata(): Record<string, string> | null {
-    const metadata: Record<string, string> = {}
-    if (name.trim()) metadata.name = name.trim()
-    if (geography.trim()) metadata.geography = geography.trim()
-    if (industry.trim()) metadata.industry = industry.trim()
+  // 7.1/N1: start from the workload's existing metadata (preserving any key
+  // this form doesn't manage - e.g. one set via the API) and only set/clear
+  // the three keys this form actually owns, instead of rebuilding the whole
+  // object from scratch (which silently dropped unknown keys, and sent
+  // `null` outright if all three managed fields were blank). See
+  // docs/reviews/2026-08-25-phase6.md Minor, Editing a workload silently
+  // destroys unknown metadata keys.
+  function buildMetadata(): Record<string, unknown> | null {
+    const metadata: Record<string, unknown> = { ...(workload?.metadata ?? {}) }
+    const setOrClear = (key: string, value: string) => {
+      const trimmed = value.trim()
+      if (trimmed) metadata[key] = trimmed
+      else delete metadata[key]
+    }
+    setOrClear('name', name)
+    setOrClear('geography', geography)
+    setOrClear('industry', industry)
     return Object.keys(metadata).length > 0 ? metadata : null
   }
 
@@ -135,6 +147,11 @@ export function WorkloadForm({ open, workload, onClose, onSaved }: WorkloadFormP
             className={fieldClass}
           />
         </label>
+
+        <p className="-mb-2 text-xs text-[var(--color-muted)]">
+          Policy profile and the two budget fields below are recorded but not yet enforced by the
+          evaluation path — only fail mode changes ControlPlane's behavior today.
+        </p>
 
         <div className="grid grid-cols-2 gap-4">
           <label className={labelClass}>

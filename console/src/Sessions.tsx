@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { fetchSessions } from './api'
-import { displayId } from './lib/format'
+import { displayId, isLedgerLive } from './lib/format'
 import type { SessionSummary } from './types'
 
 type LoadState =
@@ -25,8 +25,22 @@ function strikesSummary(strikes: Record<string, number>): string {
   return active.map(([category, count]) => `${category} ×${count}`).join(', ')
 }
 
-function EscalatedPill({ escalated }: { escalated: boolean }) {
+function EscalatedPill({ escalated, ledgerLive }: { escalated: boolean; ledgerLive: boolean }) {
   if (!escalated) return <span className="text-[var(--color-muted)]">—</span>
+  if (!ledgerLive) {
+    // 7.1/M3: the ledger that actually gates traffic expired 15 minutes
+    // after last activity; the Postgres cumulative_risk/strikes mirror
+    // never expires, so without this distinction the pill keeps claiming
+    // an active state that stopped being true.
+    return (
+      <span
+        title="This session's live Redis ledger has expired; a new turn today would start fresh."
+        className="inline-block rounded-full border border-[var(--color-border)] px-2.5 py-0.5 text-xs font-medium text-[var(--color-muted)]"
+      >
+        Escalated (expired)
+      </span>
+    )
+  }
   return (
     <span className="inline-block rounded-full border border-[var(--color-error)]/40 px-2.5 py-0.5 text-xs font-medium text-[var(--color-error)]">
       Escalated
@@ -180,7 +194,10 @@ export function Sessions() {
                       {displayId(session.workload_id, session.workload_name)}
                     </td>
                     <td className="px-4 py-3">
-                      <EscalatedPill escalated={session.escalated} />
+                      <EscalatedPill
+                        escalated={session.escalated}
+                        ledgerLive={isLedgerLive(session.ttl_expires_at)}
+                      />
                     </td>
                     <td className="px-4 py-3 tabular-nums text-[var(--color-body)]">
                       {session.cumulative_risk.toFixed(2)}

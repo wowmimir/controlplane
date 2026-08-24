@@ -79,10 +79,12 @@ already sent.
 - **Dashboard**: aggregate request/block counts, findings by category, a
   24-hour timeline. Point out the numbers include everything from the
   scenarios just run.
-- **Workloads**: the policy profile that governed all of the above
-  (`balanced`, the seeded default) — mention this is where budgets and fail
-  mode live, and where a real deployment would register more than one
-  workload for different applications or environments.
+- **Workloads**: this is where a real deployment would register per-application
+  policy — profile, budgets, and fail mode — for different applications or
+  environments. Be precise on camera: of those, only fail mode is actually
+  enforced by the evaluation path today; policy profile and the two budget
+  fields are recorded and editable here but not yet read anywhere else (see
+  the README's Known limitations).
 - **Session Drilldown**: open the hallucination session from Shot 5 — its
   finding is a real row, so this page shows exactly what proved it (category,
   confidence, evaluator tier). If you also open the escalated session from

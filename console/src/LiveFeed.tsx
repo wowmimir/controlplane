@@ -54,6 +54,15 @@ export function LiveFeed() {
   const [newIds, setNewIds] = useState<Set<string>>(new Set())
   const pausedRef = useRef(paused)
   const knownIdsRef = useRef<Set<string>>(new Set())
+  // 7.1/N3: guards the very first poll so its rows don't all get the
+  // "just arrived" highlight treatment - there's nothing to compare them
+  // against yet, so every row would otherwise look freshly arrived.
+  const firstLoadRef = useRef(true)
+  // 7.1/N4: tracks every highlight setTimeout this component has scheduled
+  // so the mount effect's cleanup can clear them on unmount - previously
+  // untracked, so navigating away within NEW_ROW_HIGHLIGHT_MS left a timer
+  // holding a stale setNewIds closure.
+  const highlightTimeoutsRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set())
 
   useEffect(() => {
     pausedRef.current = paused
@@ -63,9 +72,14 @@ export function LiveFeed() {
     fetchFeed()
       .then((data) => {
         const freshIds = new Set(data.map((entry) => entry.execution_id))
+        const isFirstLoad = firstLoadRef.current
+        firstLoadRef.current = false
+
         const arrived: string[] = []
-        for (const id of freshIds) {
-          if (!knownIdsRef.current.has(id)) arrived.push(id)
+        if (!isFirstLoad) {
+          for (const id of freshIds) {
+            if (!knownIdsRef.current.has(id)) arrived.push(id)
+          }
         }
         knownIdsRef.current = freshIds
 
@@ -74,13 +88,15 @@ export function LiveFeed() {
 
         if (arrived.length > 0) {
           setNewIds((prev) => new Set([...prev, ...arrived]))
-          setTimeout(() => {
+          const timeoutId = setTimeout(() => {
+            highlightTimeoutsRef.current.delete(timeoutId)
             setNewIds((prev) => {
               const next = new Set(prev)
               arrived.forEach((id) => next.delete(id))
               return next
             })
           }, NEW_ROW_HIGHLIGHT_MS)
+          highlightTimeoutsRef.current.add(timeoutId)
         }
       })
       .catch((error: unknown) => {
@@ -97,15 +113,21 @@ export function LiveFeed() {
     const interval = setInterval(() => {
       if (!pausedRef.current) poll()
     }, POLL_INTERVAL_MS)
-    return () => clearInterval(interval)
+    return () => {
+      clearInterval(interval)
+      highlightTimeoutsRef.current.forEach((id) => clearTimeout(id))
+      highlightTimeoutsRef.current.clear()
+    }
   }, [poll])
 
   function togglePaused() {
-    setPaused((prev) => {
-      const next = !prev
-      if (!next) poll()
-      return next
-    })
+    // 7.1/N2: poll() used to run inside the setPaused updater, which React
+    // StrictMode double-invokes in dev - pressing Resume sent two feed
+    // requests. Moved out into the click handler, a plain side effect after
+    // the state update instead of inside it.
+    const next = !paused
+    setPaused(next)
+    if (!next) poll()
   }
 
   return (

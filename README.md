@@ -41,6 +41,7 @@ uv run uvicorn app.main:app --reload --port 8000
 
 # 4. Run the console (separate terminal)
 cd console
+cp .env.example .env
 npm install
 npm run dev
 
@@ -61,6 +62,10 @@ See `.env.example` for the full list with comments. In short:
 | `REDIS_URL` | Yes | Redis — the hot session risk ledger (15-minute TTL) |
 | `MODEL_API_BASE_URL` | Yes | An OpenAI-compatible model API (built and tested against local Ollama) |
 | `MODEL_API_KEY` | No | Only needed if your model API requires one |
+
+The console has its own config: `console/.env.example` → `console/.env`,
+setting `VITE_API_BASE_URL` (defaults to `http://localhost:8000` if the file
+is missing, but the quickstart above sets it explicitly).
 
 ## API example
 
@@ -127,7 +132,14 @@ docs/        Human-facing docs (this project's demo script, review reports)
   attach — so it won't appear in the Dashboard, Session Drilldown, or Live
   Feed, even though it did block the request. Every other block type is
   fully visible.
+- **`policy_profile`, `latency_budget_ms`, and `cost_budget_per_request` are
+  recorded per workload and editable in the console, but not yet enforced.**
+  Nothing in the evaluation path reads them today — `fail_mode` is the only
+  `Workload` field that changes ControlPlane's behavior.
 - **This is a hackathon-scope build.** There's no authentication on the
   `X-Workload-Id`/`X-Session-Id` headers (a caller can assert any session),
-  and there's no automated test suite — every phase of this build was
-  self-checked against a real, running instance instead.
+  nor on the console's write endpoints (`POST`/`PATCH /api/console/workloads`
+  — anything that can reach the API port can create or edit a workload,
+  including flipping its `fail_mode`); there's also no automated test suite —
+  every phase of this build was self-checked against a real, running instance
+  instead.

@@ -115,7 +115,17 @@ async def chat_completions(
         tool_loop_count=0,
     )
     db.add(execution)
-    await db.flush()
+    # 7.1/M1: commit immediately, not just flush - this row must exist in
+    # Postgres regardless of what happens in response-side interception
+    # below. Previously this only flushed (assigning execution_id) and
+    # committed for the first time inside _run_response_side_interception;
+    # an exception raised before that commit (e.g. run_cheap_tier throwing)
+    # rolled the flushed INSERT back under fail_open, releasing a real model
+    # response with zero audit trace. Every later
+    # execution.execution_risk_score = ...; await db.commit() is now a plain
+    # UPDATE on an already-durable row. See docs/reviews/2026-08-25-phase6.md
+    # Major #1, .agents/prompts/7.1-review-fixes-plan.md.
+    await db.commit()
 
     try:
         blocked = await _run_response_side_interception(
@@ -161,9 +171,20 @@ def _model_error_response(exc: ModelCallError) -> JSONResponse:
 
 
 async def _resolve_workload(db: AsyncSession, workload_id: uuid.UUID | None) -> Workload:
-    """Header absent -> the seeded default. Present -> must already exist."""
+    """Header absent -> the seeded default. Present -> must already exist.
+
+    7.1/N9: the default lookup used to return db.get(...)'s result directly,
+    which is None if the seeded default row is ever missing (seed failed, or
+    the row was deleted directly in the database) - the caller immediately
+    dereferences workload.workload_id, producing a raw 500. Mirrors the
+    explicit-id branch's existing None-check, but as a 503 (ControlPlane
+    misconfiguration) rather than a 400 (caller error).
+    """
     if workload_id is None:
-        return await db.get(Workload, DEFAULT_WORKLOAD_ID)
+        workload = await db.get(Workload, DEFAULT_WORKLOAD_ID)
+        if workload is None:
+            raise HTTPException(status_code=503, detail="Default workload is not seeded")
+        return workload
 
     workload = await db.get(Workload, workload_id)
     if workload is None:
@@ -303,6 +324,39 @@ async def _sync_session_ledger(db: AsyncSession, session: Session, ledger: dict)
         )
 
 
+async def _safe_ledger_update(
+    db: AsyncSession,
+    session: Session,
+    execution_risk_score: float,
+    strikes_input: list[tuple[str, float]],
+    **kwargs,
+) -> dict | None:
+    """7.1/M1: a block decision, once made (and for two of its three callers,
+    already committed to Postgres as an Execution/Finding), must survive a
+    later Redis/Postgres ledger-write failure - the caller still returns its
+    already-decided 403 either way. Without this, an exception here
+    propagated out of the calling interception function to
+    chat_completions's outer try/except, which under fail_open falls through
+    to call_model and creates a SECOND Execution row for the same turn (the
+    request-side violation branch), or under fail_closed replaces an already
+    -correct 403 with a misleading 503 (the escalation branch, which has
+    nothing to lose from a failed cooldown touch). See
+    docs/reviews/2026-08-25-phase6.md Major #1,
+    .agents/prompts/7.1-review-fixes-plan.md.
+    """
+    try:
+        ledger = await apply_ledger_update(str(session.session_id), execution_risk_score, strikes_input, **kwargs)
+        await _sync_session_ledger(db, session, ledger)
+        return ledger
+    except Exception:
+        logger.error(
+            "ledger update failed for session %s (block decision already final)",
+            session.session_id,
+            exc_info=True,
+        )
+        return None
+
+
 async def _run_request_side_interception(
     db: AsyncSession, session: Session, workload: Workload, request: ChatCompletionRequest
 ) -> JSONResponse | None:
@@ -328,8 +382,7 @@ async def _run_request_side_interception(
     """
     ledger = await get_ledger(str(session.session_id))
     if is_escalated(ledger):
-        ledger = await apply_ledger_update(str(session.session_id), 0.0, [])
-        await _sync_session_ledger(db, session, ledger)
+        await _safe_ledger_update(db, session, 0.0, [])
         return _escalation_block_response()
 
     text = "\n".join(message.content for message in request.messages)
@@ -358,12 +411,12 @@ async def _run_request_side_interception(
         )
     await db.commit()
 
-    ledger = await apply_ledger_update(
-        str(session.session_id),
+    await _safe_ledger_update(
+        db,
+        session,
         execution_risk_score,
         [(candidate.category.value, candidate.confidence) for candidate in candidates],
     )
-    await _sync_session_ledger(db, session, ledger)
 
     return _policy_block_response("request", candidates)
 
@@ -471,12 +524,12 @@ async def _run_response_side_interception(
         )
     await db.commit()
 
-    ledger = await apply_ledger_update(
-        str(session.session_id),
+    await _safe_ledger_update(
+        db,
+        session,
         execution.execution_risk_score,
         [(candidate.category.value, candidate.confidence) for candidate in candidates],
     )
-    await _sync_session_ledger(db, session, ledger)
 
     return _policy_block_response("response", candidates)
 

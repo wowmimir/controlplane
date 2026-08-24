@@ -8,7 +8,11 @@ import type {
   WorkloadUpdate,
 } from './types'
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL as string
+// 7.1/M5: falls back to the documented default rather than interpolating
+// `undefined` into every request URL when console/.env is missing (e.g. a
+// fresh clone that skipped `cp .env.example .env`). See
+// docs/reviews/2026-08-25-phase6.md Major #5.
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? 'http://localhost:8000'
 
 // Distinct from a generic Error so SessionDetail.tsx can render a
 // "not found" state instead of the generic error state, per the 5.3 spec.
