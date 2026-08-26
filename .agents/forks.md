@@ -108,6 +108,19 @@ Shape: `AI Application → ControlPlane (proxy) → Model API`, both legs.
 
 ---
 
+## Fork #5: Round 2 Scope Boundary (Explicitly Deferred)
+
+**Decision:** Streaming, real authentication/multi-tenancy/public deployment, real multi-provider routing, and a real (non-simulated) retrieval-verification pipeline are explicitly out of scope for the Round 2 build. Do not build these; do not re-litigate this without a direct instruction from the user.
+
+**Rationale:** None of these are named anywhere in the Round 2 rubric's "Real-World Complexities" or "Solutioning Areas" lists, and the rubric explicitly permits "a limited or simulated scope" for the working prototype. Round 2 grading rewards demonstrating the core governance mechanism against the named complexities (varying risk tolerance per use case, the flag-vs-block tradeoff, overlapping categories, feedback loops, multi-turn compounding risk) — not production packaging. These four items remain legitimate future work and belong in the business proposal's phased roadmap as described-but-not-built, not in this build's milestone list (see `STATUS.md` Phase 8/9).
+
+- **Streaming** was already out of scope per Fork #4; this reaffirms it specifically against the Round 2 rubric too, since it's the one item that would require reshaping the response-side interception design (Fork #4) rather than an additive change.
+- **Auth/multi-tenancy/public deployment**: the existing caller-asserted-header gap (see `decisions.md`, 2026-08-23/24) stays accepted, unchanged, for this round.
+- **Real multi-provider routing**: `app/model_client.py`'s single global `MODEL_API_BASE_URL` stays as-is. Phase 8.4's multi-use-case simulation gets its "varies by model" story for free by passing a different `model` field per demo workload against the same local Ollama instance, which already serves many distinct models — no routing work needed.
+- **Real RAG/retrieval verification**: needs a document corpus, embeddings, and a vector store — several new subsystems, not a wire-up. If pursued at all, only as the explicitly-labeled "simulated" version in the optional Phase 9 (`STATUS.md`), never presented as production retrieval.
+
+---
+
 ## Consolidated Data Model
 
 ```
