@@ -85,7 +85,7 @@ class ExecutionOut(BaseModel):
     retries: int
     tool_loop_count: int
     execution_risk_score: float | None
-    blocked: bool
+    disposition: str
     created_at: datetime
     findings: list[FindingOut]
 
@@ -102,6 +102,6 @@ class FeedEntry(BaseModel):
     tokens: int | None
     latency_ms: int | None
     execution_risk_score: float | None
-    blocked: bool
+    disposition: str
     categories: list[str]
     created_at: datetime

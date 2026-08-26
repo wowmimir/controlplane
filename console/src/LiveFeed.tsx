@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { fetchFeed } from './api'
+import { DispositionBadge } from './components/DispositionBadge'
 import { displayId } from './lib/format'
 import type { FeedEntry } from './types'
 
@@ -16,20 +17,6 @@ type LoadState =
 const POLL_INTERVAL_MS = 3000
 // How long a freshly-arrived row keeps its "just arrived" accent highlight.
 const NEW_ROW_HIGHLIGHT_MS = 1000
-
-function BlockedBadge({ blocked }: { blocked: boolean }) {
-  return (
-    <span
-      className={`inline-block rounded-full border px-2.5 py-0.5 text-xs font-medium ${
-        blocked
-          ? 'border-[var(--color-error)]/40 text-[var(--color-error)]'
-          : 'border-[var(--color-success)]/40 text-[var(--color-success)]'
-      }`}
-    >
-      {blocked ? 'Blocked' : 'Clean'}
-    </span>
-  )
-}
 
 function CategoryPills({ categories }: { categories: string[] }) {
   if (categories.length === 0) return <span className="text-[var(--color-muted)]">—</span>
@@ -255,7 +242,7 @@ export function LiveFeed() {
                           {displayId(entry.workload_id, entry.workload_name)}
                         </td>
                         <td className="px-4 py-3">
-                          <BlockedBadge blocked={entry.blocked} />
+                          <DispositionBadge disposition={entry.disposition} />
                         </td>
                         <td className="px-4 py-3">
                           <CategoryPills categories={entry.categories} />

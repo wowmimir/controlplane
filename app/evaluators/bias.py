@@ -9,7 +9,7 @@ approach if ever needed.
 
 import re
 
-from app.evaluators.types import CONFIDENCE, FindingCandidate
+from app.evaluators.types import DEFAULT_CONFIDENCE, FindingCandidate
 from app.models import FindingCategory
 
 _PATTERNS = {
@@ -24,6 +24,17 @@ _PATTERNS = {
     ),
 }
 
+# 8.1: this file's own module docstring calls these patterns "a weak proxy
+# for bias" - a generalization-shaped sentence can be neutral or even
+# corrective in intent, which a regex cannot distinguish. Below
+# STRIKE_THRESHOLD: a match still blocks this turn (cheap tier's existing
+# "any match blocks unconditionally" rule, unaffected) but no longer
+# strikes/escalates. See .agents/prompts/8.1-policy-profile-enforcement-plan.md.
+_CONFIDENCE = {
+    "absolute_group_generalization": 0.65,
+    "inherent_trait_claim": 0.65,
+}
+
 
 def scan(text: str) -> list[FindingCandidate]:
     candidates = []
@@ -32,7 +43,7 @@ def scan(text: str) -> list[FindingCandidate]:
             candidates.append(
                 FindingCandidate(
                     category=FindingCategory.bias,
-                    confidence=CONFIDENCE,
+                    confidence=_CONFIDENCE.get(pattern_name, DEFAULT_CONFIDENCE),
                     evidence_ref={
                         "pattern": pattern_name,
                         "span": [match.start(), match.end()],

@@ -17,6 +17,7 @@ call already happened), writes Finding(s), updates the ledger, and returns
 """
 
 import logging
+import random
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -32,7 +33,16 @@ from app.evaluators.expensive import run_expensive_tier
 from app.evaluators.medium import run_medium_tier
 from app.evaluators.types import FindingCandidate
 from app.model_client import ModelCallError, call_model
-from app.models import EvaluatorTier, Execution, FailMode, Finding, Session, Workload
+from app.models import (
+    Disposition,
+    EvaluatorTier,
+    Execution,
+    FailMode,
+    Finding,
+    PolicyProfile,
+    Session,
+    Workload,
+)
 from app.redis_client import apply_ledger_update, get_ledger, is_escalated
 from app.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
 from app.seed import DEFAULT_WORKLOAD_ID
@@ -41,6 +51,15 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 SESSION_TTL = timedelta(minutes=15)
+
+# 8.1: a fast-profile workload's async LLM-judge (2.5) samples instead of
+# running on every clean response - the judge is async/post-release so
+# skipping it saves inference cost, not latency, and fast is the profile
+# assigned to cost-sensitive, high-volume use cases. Fixed rate, not derived
+# from Workload.cost_budget_per_request's actual value (no real per-call
+# dollar cost exists for a local Ollama backend) - see
+# .agents/prompts/8.1-policy-profile-enforcement-plan.md.
+FAST_TIER_JUDGE_SAMPLE_RATE = 0.10
 
 # Caller-facing text per ModelCallError.code - deliberately generic. The
 # real detail (raw upstream error body, MODEL_API_BASE_URL) goes to the
@@ -70,12 +89,13 @@ async def chat_completions(
     response.headers["X-Session-Id"] = str(session.session_id)
 
     try:
-        blocked = await _run_request_side_interception(db, session, workload, request)
+        blocked, request_flags = await _run_request_side_interception(db, session, workload, request)
     except Exception:
         logger.error(
             "request-side interception failed for session %s", session.session_id, exc_info=True
         )
         blocked = _internal_error_response() if workload.fail_mode == FailMode.fail_closed else None
+        request_flags = []
     if blocked is not None:
         blocked.headers["X-Workload-Id"] = str(workload.workload_id)
         blocked.headers["X-Session-Id"] = str(session.session_id)
@@ -97,8 +117,23 @@ async def chat_completions(
             latency_ms=round((time.perf_counter() - call_start) * 1000),
             retries=0,
             tool_loop_count=0,
+            # 8.2: a fast-profile request-side flag is real regardless of
+            # whether the model call then succeeded - it still gets logged
+            # against this turn's Execution row.
+            disposition=Disposition.flagged if request_flags else Disposition.clean,
         )
         db.add(failed_execution)
+        await db.flush()
+        for candidate in request_flags:
+            db.add(
+                Finding(
+                    execution_id=failed_execution.execution_id,
+                    category=candidate.category,
+                    confidence=candidate.confidence,
+                    evaluator_tier=EvaluatorTier.cheap,
+                    evidence_ref={"side": "request", **(candidate.evidence_ref or {})},
+                )
+            )
         await db.commit()
 
         error_response = _model_error_response(exc)
@@ -113,6 +148,10 @@ async def chat_completions(
         latency_ms=latency_ms,
         retries=0,
         tool_loop_count=0,
+        # 8.2: a deferred fast-profile request-side flag attaches to THIS
+        # row (the one real Execution for this model-call attempt), never a
+        # second standalone row - see _run_request_side_interception.
+        disposition=Disposition.flagged if request_flags else Disposition.clean,
     )
     db.add(execution)
     # 7.1/M1: commit immediately, not just flush - this row must exist in
@@ -125,6 +164,17 @@ async def chat_completions(
     # execution.execution_risk_score = ...; await db.commit() is now a plain
     # UPDATE on an already-durable row. See docs/reviews/2026-08-25-phase6.md
     # Major #1, .agents/prompts/7.1-review-fixes-plan.md.
+    await db.flush()
+    for candidate in request_flags:
+        db.add(
+            Finding(
+                execution_id=execution.execution_id,
+                category=candidate.category,
+                confidence=candidate.confidence,
+                evaluator_tier=EvaluatorTier.cheap,
+                evidence_ref={"side": "request", **(candidate.evidence_ref or {})},
+            )
+        )
     await db.commit()
 
     try:
@@ -359,41 +409,85 @@ async def _safe_ledger_update(
 
 async def _run_request_side_interception(
     db: AsyncSession, session: Session, workload: Workload, request: ChatCompletionRequest
-) -> JSONResponse | None:
+) -> tuple[JSONResponse | None, list[FindingCandidate]]:
     """Cheap-tier PII/prompt-injection scan on the incoming prompt, per
-    forks.md Fork #4. No violation -> None (caller falls through to the
-    model path). A violation -> persist Execution + Finding rows, update the
-    Redis ledger via apply_ledger_update (Fork #3 math, per
-    .agents/prompts/3.1-ledger-update-logic-plan.md), and return the 403 to
-    send instead of calling the model. This is a new turn (is_new_turn
-    defaults to True).
+    forks.md Fork #4. Returns (blocked_response, flagged_candidates) -
+    exactly one of the two is ever non-empty/non-None:
+      - Clean: (None, []) - caller falls through to the model path.
+      - strict/balanced hit, or an already-escalated session: persist
+        Execution + Finding rows (or, for escalation, an Execution row with
+        no Finding - see below), update the Redis ledger (Fork #3 math, per
+        .agents/prompts/3.1-ledger-update-logic-plan.md), and return the 403
+        to send instead of calling the model: (response, []).
+      - 8.2: a fast-profile hit: do NOT stop the turn (the model still gets
+        called, matching Fork #4's "flag for review" tier) and do NOT create
+        a standalone Execution row here (would violate the established "one
+        Execution row per real model-call attempt" invariant, 1.5/4.2) - the
+        ledger still updates now (flagging is still a real signal), and the
+        candidates travel back to chat_completions to attach as Finding rows
+        on the real Execution row it creates once the model call concludes:
+        (None, candidates). See
+        .agents/prompts/8.2-tiered-decision-logic-plan.md.
 
     3.2: before any of that, a read-only peek at the session's CURRENT
     ledger checks whether it is already escalated from prior turns (Fork
-    #3: cumulative_risk > 0.7 OR any strikes[category] >= 3). If so, this
-    turn's content is never scanned at all (ratified with the user - fail
-    fast, matching the existing cheap-tier philosophy applied one layer
-    earlier) - it blocks immediately, with a single zero-risk decay touch
-    so the session can cool down over subsequent turns. A NOT-escalated
-    session is never touched here (get_ledger, not apply_ledger_update) -
-    the touch only happens on this early-return path, which is that
-    request's sole conclusion, preserving 3.1's one-touch-per-request
-    invariant. See .agents/prompts/3.2-escalation-check-plan.md.
+    #3: cumulative_risk > threshold OR any strikes[category] >= count, per
+    8.1's per-profile thresholds). If so, this turn's content is never
+    scanned at all (ratified with the user - fail fast, matching the
+    existing cheap-tier philosophy applied one layer earlier) - it blocks
+    immediately, with a single zero-risk decay touch so the session can cool
+    down over subsequent turns. 8.2: this early return also now creates an
+    Execution row (disposition=blocked, execution_risk_score=None - the
+    ledger's raw cumulative_risk is unbounded and would corrupt this
+    column's 0-1 max-confidence meaning; there is still no per-turn content
+    to attach a Finding to, so none is written), where before this milestone
+    it created nothing at all (a known console-invisibility gap). A
+    NOT-escalated session is never touched here (get_ledger, not
+    apply_ledger_update) - the touch only happens on this early-return path,
+    which is that request's sole conclusion, preserving 3.1's
+    one-touch-per-request invariant. See
+    .agents/prompts/3.2-escalation-check-plan.md,
+    .agents/prompts/8.2-tiered-decision-logic-plan.md.
     """
     ledger = await get_ledger(str(session.session_id))
-    if is_escalated(ledger):
+    if is_escalated(ledger, workload.policy_profile):
+        escalation_execution = Execution(
+            session_id=session.session_id,
+            workload_id=workload.workload_id,
+            disposition=Disposition.blocked,
+            execution_risk_score=None,
+        )
+        db.add(escalation_execution)
+        await db.commit()
         await _safe_ledger_update(db, session, 0.0, [])
-        return _escalation_block_response()
+        return _escalation_block_response(), []
 
-    text = "\n".join(message.content for message in request.messages)
+    # 8.0: scan only the newest turn, not the full resent history - a real
+    # OpenAI-shaped client resends the whole conversation on every request,
+    # so joining all of request.messages here re-triggers a fresh
+    # Finding/strike on old content still present in later turns. See
+    # .agents/prompts/8.0-fix-request-side-full-history-rescan-plan.md.
+    text = request.messages[-1].content if request.messages else ""
     candidates = run_cheap_tier(text)
     if not candidates:
-        return None
+        return None, []
 
     execution_risk_score = max(candidate.confidence for candidate in candidates)
+    strikes_input = [(candidate.category.value, candidate.confidence) for candidate in candidates]
+
+    if workload.policy_profile == PolicyProfile.fast:
+        # Flagged: no standalone row here - chat_completions attaches these
+        # candidates to the real Execution row once the model call
+        # concludes (success or failure alike).
+        await _safe_ledger_update(db, session, execution_risk_score, strikes_input)
+        return None, candidates
+
+    # strict/balanced: unchanged from before this milestone, plus the new
+    # disposition field.
     execution = Execution(
         session_id=session.session_id,
         workload_id=workload.workload_id,
+        disposition=Disposition.blocked,
         execution_risk_score=execution_risk_score,
     )
     db.add(execution)
@@ -411,14 +505,56 @@ async def _run_request_side_interception(
         )
     await db.commit()
 
-    await _safe_ledger_update(
-        db,
-        session,
-        execution_risk_score,
-        [(candidate.category.value, candidate.confidence) for candidate in candidates],
-    )
+    await _safe_ledger_update(db, session, execution_risk_score, strikes_input)
 
-    return _policy_block_response("request", candidates)
+    return _policy_block_response("request", candidates), []
+
+
+def _maybe_schedule_expensive_tier(
+    background_tasks: BackgroundTasks,
+    execution_id: uuid.UUID,
+    session_id: uuid.UUID,
+    context_text: str,
+    response_text: str,
+    workload: Workload,
+    ledger: dict | None,
+    ts_anchor: float,
+) -> None:
+    """8.2: shared by every response-side branch that has a real model
+    response to judge (clean, flagged, blocked) - the async judge is
+    decision-independent (Fork #4: it can only update the ledger/audit
+    trail post-release, never block or alter what already went out), so it
+    was only ever gated by "did control flow reach the bottom of the clean
+    branch," an accident of the original control flow, not a deliberate
+    exclusion. Never called from the escalation short-circuit, per Fork
+    #4's "do not run medium/expensive tier" once escalation trips.
+
+    ledger is None when the preceding _safe_ledger_update call itself
+    failed - there is no reliable turn/timestamp anchor in that case, so
+    this turn's judge scheduling is skipped rather than guessed. See
+    .agents/prompts/8.2-tiered-decision-logic-plan.md.
+    """
+    if ledger is None:
+        return
+    # 8.1: fast-profile workloads sample the async judge instead of running
+    # it on every response, to give cost_budget_per_request's
+    # cost-sensitivity story a real effect; strict/balanced schedule it
+    # every time, unchanged from before that milestone.
+    should_sample_judge = (
+        workload.policy_profile != PolicyProfile.fast
+        or random.random() < FAST_TIER_JUDGE_SAMPLE_RATE
+    )
+    if not should_sample_judge:
+        return
+    background_tasks.add_task(
+        _run_expensive_tier_task,
+        execution_id=execution_id,
+        session_id=session_id,
+        context_text=context_text,
+        response_text=response_text,
+        turn_anchor=ledger["turn"],
+        ts_anchor=ts_anchor,
+    )
 
 
 async def _run_response_side_interception(
@@ -433,12 +569,14 @@ async def _run_response_side_interception(
     """Cheap-tier PII/prompt-injection scan on the model's response, per
     forks.md Fork #4 ("input and output are NOT treated differently").
     Reuses the same Execution row 1.4 already created for this call (real
-    tokens/latency_ms already set) - a response-side block still had a real
-    model call happen, unlike a request-side block. No violation ->
-    execution_risk_score=0.0 (evaluated, clean), response releases. A
+    tokens/latency_ms already set) - a response-side block/flag still had a
+    real model call happen, unlike a request-side block. No violation ->
+    disposition=clean, execution_risk_score=0.0, response releases. A
     violation -> persist Finding rows, set execution_risk_score to the max
-    confidence, update the Redis ledger (Fork #3 math), and return the 403
-    to send instead of releasing the response.
+    confidence, update the Redis ledger (Fork #3 math), and either return
+    the 403 (strict/balanced: disposition=blocked) or release the response
+    as None/200 (fast: disposition=flagged - 8.2's "flag for review" tier,
+    see .agents/prompts/8.2-tiered-decision-logic-plan.md).
 
     When cheap tier is clean, 2.4's medium tier runs next (per Fork #4,
     "if cheap tier is inconclusive -> run medium tier"; cheap tier has no
@@ -448,13 +586,13 @@ async def _run_response_side_interception(
     in the expensive tier instead, per the 2.4 correction), so every
     cheap-tier-clean response reaches the branch below.
 
-    2.5: when both tiers are clean, that is 2.5's async trigger condition
-    (STATUS.md: "invoked when medium tier is inconclusive"). The response
-    has already been decided-clean and is about to release; the expensive
-    tier (LLM-as-judge) is scheduled via BackgroundTasks to run *after*
-    release, since forks.md Fork #4 caps its post-release power at updating
-    the ledger/audit trail - it can never block or alter this response. See
-    .agents/prompts/2.5-expensive-llm-as-judge-plan.md.
+    2.5/8.2: the expensive tier (LLM-as-judge) is scheduled via
+    BackgroundTasks to run *after* release, from every branch that has a
+    real response to judge (clean, flagged, blocked - see
+    _maybe_schedule_expensive_tier), since forks.md Fork #4 caps its
+    post-release power at updating the ledger/audit trail - it can never
+    block or alter this response, so it doesn't matter which disposition
+    this turn landed on.
 
     3.1: this is where a clean turn's ledger touch lives (per
     .agents/prompts/3.1-ledger-update-logic-plan.md) - the one point in the
@@ -466,72 +604,135 @@ async def _run_response_side_interception(
     turn, not whenever the judge call finishes.
     """
     response_text = parsed.choices[0].message.content
+    # Deliberately still the full joined history, unlike the 8.0 fix to
+    # _run_request_side_interception's cheap-tier scan: this never feeds
+    # run_cheap_tier (medium tier is a permanent no-op stub), it only
+    # grounds the async expensive-tier judge, which benefits from full
+    # conversation context. Ratified scope cut, not an oversight - see
+    # .agents/prompts/8.0-fix-request-side-full-history-rescan-plan.md.
+    context_text = "\n".join(message.content for message in request.messages)
     cheap_candidates = run_cheap_tier(response_text)
 
-    if not cheap_candidates:
-        # 3.2: per Fork #4's literal ordering - cheap tier's result feeds
-        # the ledger -> check escalation -> only THEN decide whether medium
-        # tier runs at all. This turn's own content was clean, but the
-        # session's accumulated state might already be over threshold from
-        # prior turns; if so, block here and never reach medium/expensive
-        # tier. See .agents/prompts/3.2-escalation-check-plan.md.
-        execution.execution_risk_score = 0.0
+    if cheap_candidates:
+        # 8.2: strict/balanced keep hard-blocking exactly as before this
+        # milestone; fast flags instead - the response still releases, but
+        # the hit is logged (real Finding, real ledger update) for review.
+        disposition = (
+            Disposition.flagged if workload.policy_profile == PolicyProfile.fast else Disposition.blocked
+        )
+        execution.disposition = disposition
+        execution.execution_risk_score = max(candidate.confidence for candidate in cheap_candidates)
+        for candidate in cheap_candidates:
+            db.add(
+                Finding(
+                    execution_id=execution.execution_id,
+                    category=candidate.category,
+                    confidence=candidate.confidence,
+                    evaluator_tier=EvaluatorTier.cheap,
+                    evidence_ref={"side": "response", **(candidate.evidence_ref or {})},
+                )
+            )
         await db.commit()
 
         ts_anchor = time.time()
-        ledger = await apply_ledger_update(str(session.session_id), 0.0, [])
-        await _sync_session_ledger(db, session, ledger)
+        ledger = await _safe_ledger_update(
+            db,
+            session,
+            execution.execution_risk_score,
+            [(candidate.category.value, candidate.confidence) for candidate in cheap_candidates],
+        )
+        _maybe_schedule_expensive_tier(
+            background_tasks, execution.execution_id, session.session_id,
+            context_text, response_text, workload, ledger, ts_anchor,
+        )
 
-        if is_escalated(ledger):
-            return _escalation_block_response()
+        if disposition == Disposition.blocked:
+            return _policy_block_response("response", cheap_candidates)
+        return None  # flagged: release the already-computed response as 200
 
-        context_text = "\n".join(message.content for message in request.messages)
-        budget_remaining_ms = workload.latency_budget_ms
-        medium_candidates = run_medium_tier(context_text, response_text, budget_remaining_ms)
+    # 3.2: per Fork #4's literal ordering - cheap tier's result feeds
+    # the ledger -> check escalation -> only THEN decide whether medium
+    # tier runs at all. This turn's own content was clean, but the
+    # session's accumulated state might already be over threshold from
+    # prior turns; if so, block here and never reach medium/expensive
+    # tier. See .agents/prompts/3.2-escalation-check-plan.md.
+    #
+    # 8.2: deliberately NOT setting execution.disposition = clean here -
+    # this row's disposition may already be `flagged` (a fast-profile
+    # request-side hit chat_completions attached to this same row before
+    # response-side interception ran) and this response-side-clean branch
+    # must never downgrade that back to clean. Disposition only ever moves
+    # clean -> flagged/blocked, or flagged -> blocked (never backwards).
+    # Found and fixed during this milestone's self-check (a real bug: a
+    # fast-profile request-side flag was silently erased whenever the
+    # response side then came back clean).
+    execution.execution_risk_score = 0.0
+    await db.commit()
 
-        if not medium_candidates:
-            background_tasks.add_task(
-                _run_expensive_tier_task,
-                execution_id=execution.execution_id,
-                session_id=session.session_id,
-                context_text=context_text,
-                response_text=response_text,
-                turn_anchor=ledger["turn"],
-                ts_anchor=ts_anchor,
-            )
-            return None
+    ts_anchor = time.time()
+    # Deliberately the unwrapped apply_ledger_update, not _safe_ledger_update
+    # - per 7.1's own rationale, no decision is final yet at this point, so
+    # a failure here should correctly fall through to 3.3's fail_open/
+    # fail_closed handling rather than being swallowed.
+    ledger = await apply_ledger_update(str(session.session_id), 0.0, [])
+    await _sync_session_ledger(db, session, ledger)
 
-        # Medium-tier-violation branch: currently unreachable (2.4's stub
-        # always returns []), kept for structural completeness. See
-        # .agents/prompts/3.2-escalation-check-plan.md Follow-up - medium
-        # tier becoming real will need its own escalation re-check design.
-        candidates = medium_candidates
-        tier = EvaluatorTier.medium
-    else:
-        candidates = cheap_candidates
-        tier = EvaluatorTier.cheap
+    if is_escalated(ledger, workload.policy_profile):
+        # 8.2: this Execution row already exists (real tokens/latency_ms
+        # from the completed model call, committed above) - unlike the
+        # request-side escalation path, no new row is needed, only the
+        # disposition label. execution_risk_score stays 0.0 (this turn's
+        # own content really was clean; the session's accumulated state is
+        # what tripped, not this turn).
+        execution.disposition = Disposition.blocked
+        await db.commit()
+        return _escalation_block_response()
 
-    execution.execution_risk_score = max(candidate.confidence for candidate in candidates)
-    for candidate in candidates:
+    budget_remaining_ms = workload.latency_budget_ms
+    medium_candidates = run_medium_tier(context_text, response_text, budget_remaining_ms)
+
+    if not medium_candidates:
+        _maybe_schedule_expensive_tier(
+            background_tasks, execution.execution_id, session.session_id,
+            context_text, response_text, workload, ledger, ts_anchor,
+        )
+        return None
+
+    # Medium-tier-violation branch: currently unreachable (2.4's stub
+    # always returns []), kept for structural completeness. See
+    # .agents/prompts/3.2-escalation-check-plan.md Follow-up - medium
+    # tier becoming real will need its own escalation re-check design.
+    disposition = (
+        Disposition.flagged if workload.policy_profile == PolicyProfile.fast else Disposition.blocked
+    )
+    execution.disposition = disposition
+    execution.execution_risk_score = max(candidate.confidence for candidate in medium_candidates)
+    for candidate in medium_candidates:
         db.add(
             Finding(
                 execution_id=execution.execution_id,
                 category=candidate.category,
                 confidence=candidate.confidence,
-                evaluator_tier=tier,
+                evaluator_tier=EvaluatorTier.medium,
                 evidence_ref={"side": "response", **(candidate.evidence_ref or {})},
             )
         )
     await db.commit()
 
-    await _safe_ledger_update(
+    ledger = await _safe_ledger_update(
         db,
         session,
         execution.execution_risk_score,
-        [(candidate.category.value, candidate.confidence) for candidate in candidates],
+        [(candidate.category.value, candidate.confidence) for candidate in medium_candidates],
+    )
+    _maybe_schedule_expensive_tier(
+        background_tasks, execution.execution_id, session.session_id,
+        context_text, response_text, workload, ledger, ts_anchor,
     )
 
-    return _policy_block_response("response", candidates)
+    if disposition == Disposition.blocked:
+        return _policy_block_response("response", medium_candidates)
+    return None
 
 
 async def _run_expensive_tier_task(
@@ -564,15 +765,29 @@ async def _run_expensive_tier_task(
     cumulative_risk can decay twice (once synchronously at 0.0, once again
     here for real) - an accepted, self-correcting quirk, not a bug; see
     .agents/prompts/3.1-ledger-update-logic-plan.md's Rationale.
+
+    8.2: since the judge can now also fire after a flagged/blocked cheap-tier
+    hit (not only after a clean turn), execution.execution_risk_score may
+    already be non-zero when this task runs. The ledger's own synchronous
+    touch for that hit already contributed the cheap-tier score as its own
+    decay+add event - this call must contribute only the judge's OWN new
+    score (judge_score) as this event's contribution, never the cheap+judge
+    merged value, or the cheap-tier's contribution would be double-counted
+    into cumulative_risk. execution.execution_risk_score itself (the
+    Postgres column, Fork #2's "max confidence across all Findings in that
+    execution") is separately updated to the max of whatever it already was
+    and judge_score.
     """
     try:
         candidates = await run_expensive_tier(context_text, response_text)
         if not candidates:
             return
 
+        judge_score = max(candidate.confidence for candidate in candidates)
+
         async with async_session() as db:
             execution = await db.get(Execution, execution_id)
-            execution.execution_risk_score = max(candidate.confidence for candidate in candidates)
+            execution.execution_risk_score = max(execution.execution_risk_score or 0.0, judge_score)
             for candidate in candidates:
                 db.add(
                     Finding(
@@ -587,7 +802,7 @@ async def _run_expensive_tier_task(
 
             ledger = await apply_ledger_update(
                 str(session_id),
-                execution.execution_risk_score,
+                judge_score,
                 [(candidate.category.value, candidate.confidence) for candidate in candidates],
                 is_new_turn=False,
                 turn_anchor=turn_anchor,

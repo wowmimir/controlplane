@@ -18,6 +18,8 @@ from dotenv import load_dotenv
 from redis.asyncio import Redis
 from redis.exceptions import WatchError
 
+from app.models import PolicyProfile
+
 load_dotenv()
 
 REDIS_URL = os.environ["REDIS_URL"]
@@ -48,8 +50,19 @@ STRIKE_WINDOW_SECONDS = 120
 # strikes[category] >= 3. See .agents/prompts/3.2-escalation-check-plan.md -
 # is_escalated() is a pure predicate, never touches Redis itself; callers
 # supply an already-read-or-updated ledger.
-ESCALATION_RISK_THRESHOLD = 0.7
-ESCALATION_STRIKE_COUNT = 3
+#
+# 8.1: these numbers are now per-profile, not one global pair. `strict`
+# escalates sooner (tighter risk/strike ceiling); `balanced` keeps the
+# original numbers unchanged (it's the seeded default - regression
+# guardrail); `fast` deliberately keeps balanced's numbers too - its
+# leniency comes from 8.2's future flag-not-block tiering and this
+# milestone's judge-sampling, not from looser escalation math. See
+# .agents/prompts/8.1-policy-profile-enforcement-plan.md.
+PROFILE_ESCALATION_THRESHOLDS: dict[PolicyProfile, tuple[float, int]] = {
+    PolicyProfile.strict: (0.5, 2),
+    PolicyProfile.balanced: (0.7, 3),
+    PolicyProfile.fast: (0.7, 3),
+}
 
 # 7.1/M2: apply_ledger_update's WATCH/MULTI/EXEC retries against a
 # concurrent writer on the same key before giving up. Contention this high
@@ -170,11 +183,18 @@ async def apply_ledger_update(
     raise RuntimeError(f"apply_ledger_update: too much contention on session {session_id}")
 
 
-def is_escalated(ledger: dict[str, Any]) -> bool:
-    """Fork #3's exact escalation condition. Pure predicate - does not read
-    or write Redis; the caller supplies an already-current ledger (a fresh
+def is_escalated(ledger: dict[str, Any], policy_profile: PolicyProfile) -> bool:
+    """Fork #3's exact escalation condition, thresholds keyed by profile
+    (8.1: PROFILE_ESCALATION_THRESHOLDS). Pure predicate - does not read or
+    write Redis; the caller supplies an already-current ledger (a fresh
     get_ledger() peek, or the dict apply_ledger_update() just returned).
+
+    policy_profile is required, not defaulted - a call site that forgets to
+    pass it fails loudly (TypeError) rather than silently reporting every
+    workload's escalation status as if it were balanced. See
+    .agents/prompts/8.1-policy-profile-enforcement-plan.md.
     """
-    if ledger["cumulative_risk"] > ESCALATION_RISK_THRESHOLD:
+    risk_threshold, strike_count = PROFILE_ESCALATION_THRESHOLDS[policy_profile]
+    if ledger["cumulative_risk"] > risk_threshold:
         return True
-    return any(count >= ESCALATION_STRIKE_COUNT for count in ledger["strikes"].values())
+    return any(count >= strike_count for count in ledger["strikes"].values())

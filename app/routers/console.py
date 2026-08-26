@@ -2,13 +2,7 @@
 
 GET /summary: read-only dashboard aggregates. Per
 .agents/prompts/5.1-dashboard-plan.md: total_requests/blocked_count are
-all-time Postgres counts. blocked_count excludes Executions whose only
-Finding(s) are evaluator_tier=expensive - 2.5's async judge can only update
-the ledger/audit trail post-release (Fork #4), it never actually blocks
-anything. Escalation blocks (3.2) write no Postgres row at all (Redis-only,
-15-min TTL, no durable history), so they cannot be counted here by any
-query; the console UI shows a caveat about that gap instead of silently
-over- or under-claiming.
+all-time Postgres counts.
 
 GET/POST /workloads, PATCH /workloads/{workload_id}: workload management
 (list/create/edit), per .agents/prompts/5.2-workload-management-view-plan.md
@@ -24,17 +18,27 @@ happened historically," while Session/Execution/Finding in Postgres are the
 durable audit trail (4.1-4.3). `escalated` reuses is_escalated()
 (app.redis_client) verbatim against the session's Postgres-sourced
 {cumulative_risk, strikes} rather than re-deriving Fork #3's threshold
-check. Per-execution `blocked` reuses get_summary's own
-evaluator_tier != expensive definition.
+check.
 
 GET /feed: live feed, per .agents/prompts/5.4-live-feed-plan.md. The 25 most
 recent Executions across ALL sessions/workloads (not scoped to one session,
 unlike /sessions), polled by the console every ~3s - a flat most-recent-N
 query, no `since` cursor (demo traffic volume doesn't need one, per the
-spec's Rationale). `blocked`/`categories` reuse the same
-evaluator_tier != expensive rule as /summary and /sessions/{id}. Escalation
-blocks still write no Execution row, so they never appear here either - the
-same accepted gap already documented on /summary and /sessions/{id}.
+spec's Rationale).
+
+8.2: `disposition` (clean/flagged/blocked) is a real column on Execution,
+set explicitly at every write site in app/routers/chat.py. This replaces
+the old evaluator_tier != expensive Finding-join inference (a deleted
+_is_blocked helper, plus two more independently-written inline joins inside
+get_summary) with a direct column read everywhere a "was this blocked" fact
+is needed - see .agents/prompts/8.2-tiered-decision-logic-plan.md. A
+request-side escalation block now gets its own Execution row
+(disposition=blocked); a response-side escalation block sets disposition
+on the row that already existed for that turn's completed model call -
+either way, escalation blocks are now visible to every query below, where
+before this milestone they were invisible to all of them (no Finding
+existed for a join to find). A `fast`-profile cheap-tier hit releases as
+200 with disposition=flagged instead of blocking.
 """
 
 import uuid
@@ -46,7 +50,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
-from app.models import EvaluatorTier, Execution, Finding, Session, Workload
+from app.models import Disposition, Execution, Finding, PolicyProfile, Session, Workload
 from app.redis_client import is_escalated
 from app.schemas.console import (
     CategoryCount,
@@ -72,9 +76,6 @@ def _workload_name(workload: Workload | None) -> str | None:
     return workload.metadata_.get("name")
 
 
-def _is_blocked(findings: list[Finding]) -> bool:
-    return any(finding.evaluator_tier != EvaluatorTier.expensive for finding in findings)
-
 router = APIRouter(prefix="/api/console")
 
 OVER_TIME_WINDOW = timedelta(hours=24)
@@ -96,12 +97,12 @@ def _to_workload_out(workload: Workload) -> WorkloadOut:
 async def get_summary(db: AsyncSession = Depends(get_db)) -> DashboardSummary:
     total_requests = await db.scalar(select(func.count(Execution.execution_id))) or 0
 
+    # 8.2: a direct disposition read, no Finding join - this is also the fix
+    # that makes an escalation block (no Finding, disposition=blocked) count
+    # here for the first time.
     blocked_count = (
         await db.scalar(
-            select(func.count(func.distinct(Execution.execution_id)))
-            .select_from(Execution)
-            .join(Finding, Finding.execution_id == Execution.execution_id)
-            .where(Finding.evaluator_tier != EvaluatorTier.expensive)
+            select(func.count(Execution.execution_id)).where(Execution.disposition == Disposition.blocked)
         )
         or 0
     )
@@ -126,13 +127,11 @@ async def get_summary(db: AsyncSession = Depends(get_db)) -> DashboardSummary:
     blocked_bucket_rows = await db.execute(
         select(
             func.date_trunc("hour", Execution.created_at).label("bucket"),
-            func.count(func.distinct(Execution.execution_id)).label("blocked"),
+            func.count(Execution.execution_id).label("blocked"),
         )
-        .select_from(Execution)
-        .join(Finding, Finding.execution_id == Execution.execution_id)
         .where(
             Execution.created_at >= window_start,
-            Finding.evaluator_tier != EvaluatorTier.expensive,
+            Execution.disposition == Disposition.blocked,
         )
         .group_by("bucket")
     )
@@ -224,7 +223,13 @@ async def list_sessions(db: AsyncSession = Depends(get_db)) -> list[SessionSumma
             cumulative_risk=session.cumulative_risk,
             strikes=session.strikes,
             escalated=is_escalated(
-                {"cumulative_risk": session.cumulative_risk, "strikes": session.strikes}
+                {"cumulative_risk": session.cumulative_risk, "strikes": session.strikes},
+                # 8.1: is_escalated's thresholds are now per-profile; the
+                # None fallback is defensive only (no delete endpoint exists,
+                # so a session's workload row can never actually be missing
+                # today) - see
+                # .agents/prompts/8.1-policy-profile-enforcement-plan.md.
+                workload.policy_profile if workload is not None else PolicyProfile.balanced,
             ),
             execution_count=execution_counts.get(session.session_id, 0),
             ttl_expires_at=session.ttl_expires_at,
@@ -270,7 +275,7 @@ async def get_session_detail(
             retries=execution.retries,
             tool_loop_count=execution.tool_loop_count,
             execution_risk_score=execution.execution_risk_score,
-            blocked=_is_blocked(findings_by_execution[execution.execution_id]),
+            disposition=execution.disposition.value,
             created_at=execution.created_at,
             findings=[
                 FindingOut(
@@ -294,7 +299,8 @@ async def get_session_detail(
         cumulative_risk=session.cumulative_risk,
         strikes=session.strikes,
         escalated=is_escalated(
-            {"cumulative_risk": session.cumulative_risk, "strikes": session.strikes}
+            {"cumulative_risk": session.cumulative_risk, "strikes": session.strikes},
+            workload.policy_profile if workload is not None else PolicyProfile.balanced,
         ),
         execution_count=len(executions),
         ttl_expires_at=session.ttl_expires_at,
@@ -332,7 +338,7 @@ async def get_feed(db: AsyncSession = Depends(get_db)) -> list[FeedEntry]:
             tokens=execution.tokens,
             latency_ms=execution.latency_ms,
             execution_risk_score=execution.execution_risk_score,
-            blocked=_is_blocked(findings_by_execution[execution.execution_id]),
+            disposition=execution.disposition.value,
             categories=sorted(
                 {finding.category.value for finding in findings_by_execution[execution.execution_id]}
             ),

@@ -10,7 +10,7 @@ computed score (see CONFIDENCE in evaluators/cheap.py).
 import re
 from typing import Callable
 
-from app.evaluators.types import CONFIDENCE, FindingCandidate
+from app.evaluators.types import DEFAULT_CONFIDENCE, FindingCandidate
 from app.models import FindingCategory
 
 _PATTERNS = {
@@ -38,6 +38,21 @@ _PATTERNS = {
         r"|(?:4\d{3}|5[1-5]\d{2}|6011|65\d{2})[ -]?\d{4}[ -]?\d{4}(?:[ -]?\d{1,4})?"
         r")(?!\d)"
     ),
+}
+
+# 8.1: per-pattern confidence, replacing the old flat CONFIDENCE=0.95 used by
+# every pattern. credit_card is Luhn-validated (near-certain); ssn/email are
+# rigid, low-collision shapes; phone already carries an accepted residual
+# false-positive risk (2.1); ip_address is indistinguishable from a
+# version-like string by regex alone (2.1's own accepted limitation) - below
+# STRIKE_THRESHOLD, so a match still blocks this turn but no longer
+# strikes/escalates. See .agents/prompts/8.1-policy-profile-enforcement-plan.md.
+_CONFIDENCE = {
+    "credit_card": 0.99,
+    "ssn": 0.95,
+    "email": 0.95,
+    "phone": 0.75,
+    "ip_address": 0.6,
 }
 
 
@@ -68,7 +83,7 @@ def scan(text: str) -> list[FindingCandidate]:
             candidates.append(
                 FindingCandidate(
                     category=FindingCategory.pii,
-                    confidence=CONFIDENCE,
+                    confidence=_CONFIDENCE.get(pattern_name, DEFAULT_CONFIDENCE),
                     evidence_ref={
                         "pattern": pattern_name,
                         "span": [match.start(), match.end()],

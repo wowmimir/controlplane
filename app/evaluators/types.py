@@ -7,11 +7,13 @@ from dataclasses import dataclass
 
 from app.models import FindingCategory
 
-# Regex matches are deterministic (a pattern either matches or it doesn't),
-# so every cheap-tier hit gets this fixed high confidence rather than a
-# computed score. Also the strike-increment threshold from forks.md Fork #3
-# ("increment when confidence > 0.7"), so any cheap-tier match strikes.
-CONFIDENCE = 0.95
+# 8.1: each evaluator file now assigns confidence per pattern (a _CONFIDENCE
+# map next to its _PATTERNS dict), reflecting that pattern's real precision -
+# a Luhn-validated credit_card is far more certain than an ip_address regex
+# that can't be told apart from a version string. This is only the fallback
+# for a pattern name missing from its file's _CONFIDENCE map (should not
+# normally be reached - every pattern should have an explicit entry).
+DEFAULT_CONFIDENCE = 0.95
 
 
 @dataclass

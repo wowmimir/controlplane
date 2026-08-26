@@ -70,6 +70,11 @@ export interface FindingOut {
   timestamp: string
 }
 
+// 8.2: clean/flagged/blocked - a fast-profile cheap-tier hit releases as
+// 200 with disposition=flagged instead of blocking (strict/balanced keep
+// hard-blocking). Replaces the old derived `blocked: boolean`.
+export type Disposition = 'clean' | 'flagged' | 'blocked'
+
 export interface ExecutionOut {
   execution_id: string
   tokens: number | null
@@ -77,7 +82,7 @@ export interface ExecutionOut {
   retries: number
   tool_loop_count: number
   execution_risk_score: number | null
-  blocked: boolean
+  disposition: Disposition
   created_at: string
   findings: FindingOut[]
 }
@@ -95,7 +100,7 @@ export interface FeedEntry {
   tokens: number | null
   latency_ms: number | null
   execution_risk_score: number | null
-  blocked: boolean
+  disposition: Disposition
   categories: string[]
   created_at: string
 }

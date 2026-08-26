@@ -11,7 +11,7 @@ prompt_injection.py's fake_role_marker pattern already set.
 
 import re
 
-from app.evaluators.types import CONFIDENCE, FindingCandidate
+from app.evaluators.types import DEFAULT_CONFIDENCE, FindingCandidate
 from app.models import FindingCategory
 
 _PATTERNS = {
@@ -29,6 +29,17 @@ _PATTERNS = {
     ),
 }
 
+# 8.1: this file was already curated down to only unambiguous phrasings
+# (2.6's own docstring: "not a slur or profanity word list"), specifically
+# for high precision - no further per-pattern split is warranted within an
+# already-narrow, already-high-precision set. See
+# .agents/prompts/8.1-policy-profile-enforcement-plan.md.
+_CONFIDENCE = {
+    "direct_insult": 0.95,
+    "death_wish_or_threat": 0.95,
+    "dehumanizing_language": 0.95,
+}
+
 
 def scan(text: str) -> list[FindingCandidate]:
     candidates = []
@@ -37,7 +48,7 @@ def scan(text: str) -> list[FindingCandidate]:
             candidates.append(
                 FindingCandidate(
                     category=FindingCategory.toxicity,
-                    confidence=CONFIDENCE,
+                    confidence=_CONFIDENCE.get(pattern_name, DEFAULT_CONFIDENCE),
                     evidence_ref={
                         "pattern": pattern_name,
                         "span": [match.start(), match.end()],

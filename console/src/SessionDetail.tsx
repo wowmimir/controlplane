@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { fetchSessionDetail, NotFoundError } from './api'
+import { DispositionBadge } from './components/DispositionBadge'
 import { displayId, isLedgerLive } from './lib/format'
 import type { ExecutionOut, FindingOut, SessionDetail as SessionDetailData } from './types'
 
@@ -36,20 +37,6 @@ function StrikeBadge({ category, count }: { category: string; count: number }) {
   )
 }
 
-function BlockedBadge({ blocked }: { blocked: boolean }) {
-  return (
-    <span
-      className={`inline-block rounded-full border px-2.5 py-0.5 text-xs font-medium ${
-        blocked
-          ? 'border-[var(--color-error)]/40 text-[var(--color-error)]'
-          : 'border-[var(--color-success)]/40 text-[var(--color-success)]'
-      }`}
-    >
-      {blocked ? 'Blocked' : 'Clean'}
-    </span>
-  )
-}
-
 function FindingRow({ finding }: { finding: FindingOut }) {
   return (
     <li className="flex flex-wrap items-center gap-3 border-t border-[var(--color-border)] px-4 py-3 text-sm first:border-t-0">
@@ -75,7 +62,7 @@ function ExecutionCard({ execution, index }: { execution: ExecutionOut; index: n
     <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-surface)]">
       <div className="flex flex-wrap items-center gap-4 px-4 py-3">
         <span className="text-sm font-medium text-[var(--color-ink)]">Turn {index + 1}</span>
-        <BlockedBadge blocked={execution.blocked} />
+        <DispositionBadge disposition={execution.disposition} />
         <span className="text-sm text-[var(--color-muted)]">
           {execution.tokens != null ? `${execution.tokens.toLocaleString()} tokens` : 'no model call'}
         </span>

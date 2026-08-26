@@ -6,7 +6,7 @@ reversible starting set of common jailbreak/override phrases.
 
 import re
 
-from app.evaluators.types import CONFIDENCE, FindingCandidate
+from app.evaluators.types import DEFAULT_CONFIDENCE, FindingCandidate
 from app.models import FindingCategory
 
 _PATTERNS = {
@@ -46,6 +46,27 @@ _PATTERNS = {
     ),
 }
 
+# 8.1: per-pattern confidence. The original five plus other_jailbreak_persona
+# and new_instructions are literal, unambiguous jailbreak framing (low
+# real-world false-positive rate). reveal_system_prompt/roleplay_bypass/
+# unfiltered_mode/extract_instructions are still clearly suspicious but each
+# has a plausible (if unusual) benign framing. fake_role_marker is the
+# explicitly documented false-positive case (a pasted transcript starting a
+# line with "System:") - below STRIKE_THRESHOLD. See
+# .agents/prompts/8.1-policy-profile-enforcement-plan.md.
+_CONFIDENCE = {
+    "ignore_instructions": 0.95,
+    "disregard_above": 0.95,
+    "dan_jailbreak": 0.95,
+    "other_jailbreak_persona": 0.95,
+    "new_instructions": 0.95,
+    "reveal_system_prompt": 0.8,
+    "roleplay_bypass": 0.8,
+    "unfiltered_mode": 0.8,
+    "extract_instructions": 0.8,
+    "fake_role_marker": 0.6,
+}
+
 
 def scan(text: str) -> list[FindingCandidate]:
     candidates = []
@@ -54,7 +75,7 @@ def scan(text: str) -> list[FindingCandidate]:
             candidates.append(
                 FindingCandidate(
                     category=FindingCategory.prompt_injection,
-                    confidence=CONFIDENCE,
+                    confidence=_CONFIDENCE.get(pattern_name, DEFAULT_CONFIDENCE),
                     evidence_ref={
                         "pattern": pattern_name,
                         "span": [match.start(), match.end()],
