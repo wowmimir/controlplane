@@ -16,11 +16,12 @@ us in a position where the honest answer contradicts the deck.
 
 - **Real and demoable today**: the governance proxy itself (request/response scanning across 6
   categories, 3 evaluator tiers, the session risk ledger with decay/strikes/escalation, the audit
-  trail, the console). This is the actual proof-of-concept — lead with it.
-- **In progress for Round 2** (see `.agents/STATUS.md` Phase 8): policy actually varying by use
-  case, a flag-vs-block tiered response instead of binary, a human feedback/false-positive-rate
-  loop, multiple simulated use cases. These are "what we're actively building," not vaporware —
-  fine to describe as near-term/in-flight.
+  trail, the console) — *plus* everything from the Round 2 work (`.agents/STATUS.md` Phases 8 and
+  10): policy that varies behavior by use case, a block / redact / flag-for-review tiered response,
+  a human feedback loop with a live per-pattern false-positive rate, per-workload category
+  overrides, three simulated concurrent use cases, a measured governance-overhead stat, and a
+  browser prompt playground. This is the actual proof-of-concept — lead with it. Verify any
+  specific claim against `.agents/STATUS.md` before writing it as done.
 - **Explicitly NOT built, and not being built before the deadline** (see `.agents/forks.md` Fork
   #5): user signup, API keys, a hosted public product, real multi-provider model routing, real
   retrieval-verification (RAG), streaming. **Do not describe these in present tense.** They belong
@@ -67,12 +68,12 @@ claim, it's a description of working code:**
 
 | Rubric's stated complexity | How ControlPlane answers it today |
 |---|---|
-| "A single one-size-fits-all checking approach rarely works" | Per-app policy container (`Workload`); Round 2 work makes it actually vary risk tolerance and latency budget by use case, not just carry the label |
+| "A single one-size-fits-all checking approach rarely works" | Per-app policy container (`Workload`): the profile (`strict` / `balanced` / `fast`) sets the escalation thresholds *and* picks the response action — hard-block, redact-and-release, or flag-for-review — so risk tolerance genuinely varies by use case. (Latency/cost budgets are still recorded-only.) |
 | "Bias, hallucination, and privacy risks often overlap" | Independent single-purpose evaluators per category, but one incident can produce multiple findings across categories simultaneously — no forced single-label classification |
 | "No reliable real-time ground truth... makes automated verification difficult" | Discovered firsthand during testing: the model refuses to fabricate on request, and the AI-judge correctly recognized a truthful correction as *not* a hallucination — cite this as evidence we've actually grappled with the problem, not guessed at it |
-| "Over-flagging creates alert fatigue; under-flagging creates liability" | Round 2 work adds a third state (flag-for-review) between silent-pass and hard-block, so this tradeoff is tunable per use case instead of all-or-nothing |
+| "Over-flagging creates alert fatigue; under-flagging creates liability" | Four outcomes now exist — pass, flag-for-review, redact-and-release, hard-block — chosen by the workload's profile, so this tradeoff is tunable per use case instead of all-or-nothing. A human confirm/reject loop feeds a live false-positive rate per detection pattern |
 | "Multi-turn conversations... introduce compounding risk" | The core mechanism: a per-session risk ledger that decays on clean turns and escalates on a pattern, blocking a *future* clean message purely on accumulated history |
-| "Regulatory expectations differ by geography/industry... rigid rules age quickly" | Policy is already scoped per registered app (workload), which is the natural axis to extend to geography/industry — describe as a near-term extension, not built today |
+| "Regulatory expectations differ by geography/industry... rigid rules age quickly" | Policy is scoped per registered app (workload), carries geography/industry tags, and per-category overrides (disable a check, raise a confidence floor, mute a pattern) let one workload evaluate content differently from another — the demo set includes an EU / GDPR-tagged `strict` workload. Driving more of the policy automatically from the tags is the near-term step |
 | "Enterprises consume a model via API... limiting how deeply a checker can inspect internals" | The whole design was input/output-only from day one — never assumes access to model weights or internals |
 
 Architecture, in one sentence for the proposal: **pre-response gate (blocks before the model is
@@ -111,15 +112,19 @@ Reuse this structure directly — it's already locked in the code's own planning
 drift out of sync with what's actually built:
 
 - **Phase 1 (built, demoable now)** — the core proxy: 6-category taxonomy, 3 evaluator tiers, the
-  session risk ledger (decay/strikes/escalation), full audit trail, a 4-page console (dashboard,
-  workload management, session drilldown, live feed).
-- **Phase 2 (Round 2, in progress — `.agents/STATUS.md` Phase 8)** — policy that actually varies
-  behavior by use case, tiered allow/flag/block decisions, a human feedback loop with a real
-  false-positive-rate metric, multiple simulated concurrent use cases.
+  session risk ledger (decay/strikes/escalation), full audit trail, and the operator console
+  (dashboard, workload management, sessions + drilldown, live feed).
+- **Phase 2 (built — `.agents/STATUS.md` Phases 8 and 10)** — policy that actually varies behavior
+  by use case (per-profile escalation thresholds plus a block / redact-and-release / flag-for-review
+  action split), a human feedback loop with a live per-pattern false-positive rate (the Review and
+  Detection Health console pages), per-workload category overrides, three simulated concurrent use
+  cases run against a labelled corpus for a real recall figure, a measured `governance_overhead_ms`
+  stat, and a browser prompt playground for typing test traffic live.
 - **Phase 3 (near-term, not started)** — real embedding/statistical detection for the currently-stub
   middle tier, retrieval-grounded verification against real source documents (today's AI-judge only
-  checks internal consistency, not real-world facts), agent/tool-call-aware risk tracking for
-  systems that take actions, not just generate text.
+  checks internal consistency, not real-world facts; a deliberately *simulated* RAG check was
+  scoped as optional and skipped), agent/tool-call-aware risk tracking for systems that take
+  actions, not just generate text.
 - **Phase 4 (product maturity, not started)** — real authentication and multi-tenancy, self-serve
   signup and API key issuance, a hosted deployment, multi-provider model routing, streaming support.
   Be honest here: this phase is what turns a working mechanism into an actual product a stranger
@@ -129,14 +134,17 @@ drift out of sync with what's actually built:
 ## 6. Key Risks and Mitigations
 
 - **False positives / false negatives from pattern-based detection** — mitigated by the tiered
-  fallback (cheap → medium → AI-judge) and, starting Round 2, a real feedback loop that measures and
-  surfaces the actual false-positive rate instead of assuming detection is perfect.
+  fallback (cheap → medium → AI-judge) and a feedback loop that measures and surfaces the actual
+  false-positive rate *per detection pattern* (the Review and Detection Health pages), instead of
+  assuming detection is perfect. False-negative rate on open traffic stays structurally
+  unmeasurable without independent ground truth — the labelled-corpus recall figure from the
+  multi-use-case sim is the honest proxy, and the proposal should say so.
 - **Added latency from a governance layer** — the synchronous checks are single-digit-millisecond
   regex/keyword scans by design; the AI-judge tier runs asynchronously *after* the response is
-  already released, so it adds zero latency to what the user experiences. Cite this as a measured
-  property, not a hope — `.agents/STATUS.md` Phase 8.4 adds a real `governance_overhead_ms` stat for
-  exactly this; if it hasn't shipped yet when you're writing, soften "measured" to "designed to be
-  single-digit-millisecond, with live measurement in progress" rather than overclaiming.
+  already released, so it adds zero latency to what the user experiences. This is now measured, not
+  asserted: every full-pipeline turn records `governance_overhead_ms` (wall-clock time of the
+  interception code, excluding the model call), surfaced as a p50/p95 pair on the Dashboard — cite
+  those numbers directly.
 - **Async-judge throughput at scale** — the background AI-judge check runs in-process (no job queue
   yet, by deliberate MVP scope — see `forks.md` Fork #5), and individual judge calls have been
   observed taking up to ~11-12 seconds. At the brief's "tens of thousands of interactions/week"

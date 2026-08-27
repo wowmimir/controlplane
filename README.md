@@ -11,17 +11,22 @@ taxonomy — `pii`, `hallucination`, `toxicity`, `bias`, `prompt_injection`,
 
 - **Cheap** — synchronous regex/keyword checks (PII, prompt injection,
   toxicity, bias, secrets), gating release on both the request and the
-  response side.
+  response side. What a match *does* depends on the workload's policy
+  profile: `strict` blocks; `balanced` blocks too, except that for PII or
+  secrets in a *response* it blanks the offending spans and releases the
+  rest; `fast` flags for review and releases.
 - **Medium** — a stubbed slot for embedding-similarity checks; wired but not
   implemented in this build.
 - **Expensive** — an LLM-as-judge check, run asynchronously after the
-  response has already been released, comparing the response against the
-  request's context for unsupported or contradicted claims.
+  response has already been released (on every turn, or a ~10% sample for a
+  `fast` workload), comparing the response against the request's context for
+  unsupported or contradicted claims.
 
 A per-session risk ledger accumulates across turns: `cumulative_risk` decays
 and adds on every turn, per-category strikes expire on a rolling window, and
 a session that crosses either threshold gets blocked on its *next* request
-regardless of that request's own content. This is what lets ControlPlane
+regardless of that request's own content (the thresholds themselves vary by
+policy profile — `strict` trips sooner). This is what lets ControlPlane
 catch a pattern of bad behavior, not just a single bad message. The exact
 math is locked in `.agents/forks.md` (Fork #3) — this README describes the
 shape, not the constants, so the two can't drift out of sync.
@@ -47,6 +52,9 @@ npm run dev
 
 # 5. Populate the console with real traffic before you look at it
 uv run python scripts/seed_demo.py
+
+# 6. (optional) register three differentiated demo workloads + shaped traffic
+uv run python scripts/simulate_use_cases.py
 ```
 
 The backend serves on `http://localhost:8000`, the console on
@@ -89,35 +97,43 @@ curl http://localhost:8000/v1/chat/completions \
 ```json
 {
   "error": {
+    "message": "Request blocked by ControlPlane: pii detected in input.",
     "type": "controlplane_policy_violation",
-    "code": "pii",
-    "message": "Request blocked: pii detected in input."
+    "param": null,
+    "code": "pii"
   }
 }
 ```
 
-An optional `X-Workload-Id` header selects a policy profile (falls back to a
-seeded `default` workload); an optional `X-Session-Id` header threads a
-request into an existing session's risk ledger. Both are echoed back as
-response headers, so a caller that omits `X-Session-Id` can still learn and
+An optional `X-Workload-Id` header names a registered `Workload` whose policy
+profile, fail mode, and per-category evaluator overrides govern the request
+(falls back to a seeded `default` workload); an optional `X-Session-Id` header
+threads a request into an existing session's risk ledger. Both are echoed back
+as response headers, so a caller that omits `X-Session-Id` can still learn and
 reuse the session ControlPlane generated for it.
 
 ## Console
 
+Seven pages (plus a per-session drilldown), in `console/` (React + TypeScript + Vite + Tailwind):
+
 | Page | Shows |
 |---|---|
-| Dashboard | Aggregate request/block counts, findings by category, requests over time |
-| Workloads | List, create, and edit policy profiles (`strict` / `balanced` / `fast`), latency and cost budgets, fail mode |
-| Session Drilldown | One session's ledger state (risk, strikes, escalated) and every execution/finding that fed it — the "why was this blocked" view |
+| Dashboard | Aggregate request/block counts, findings by category, requests over time, governance-overhead p50/p95, and the false-positive rate across reviewed findings |
+| Workloads | List, create, and edit workloads — policy profile (`strict` / `balanced` / `fast`), fail mode, latency/cost budgets, and per-category evaluator overrides |
+| Sessions | Every session with its current ledger state; click a row for the drilldown — one session's risk / strikes / escalation and every execution and finding that fed it, the "why was this blocked" view |
+| Review | Confirm or reject individual findings; feeds the Dashboard's false-positive rate |
+| Detection Health | Per-pattern false-positive rate across all workloads, with a per-workload "suppress this pattern" toggle |
 | Live Feed | The most recent executions across all sessions, polling every ~3 seconds |
+| Playground | Type prompts straight through the proxy from the browser and see the reply, or the block reason and category; threads one session across turns |
 
 ## Project structure
 
 ```
 app/         FastAPI backend — routers, evaluators, models, Redis/Postgres clients
 console/     React + TypeScript + Tailwind frontend (Vite)
-scripts/     seed_demo.py — scripted traffic for demos and local testing
-docs/        Human-facing docs (this project's demo script, review reports)
+scripts/     seed_demo.py (a demo shot list) and simulate_use_cases.py (three
+             differentiated workloads fed a labelled test corpus)
+docs/        Human-facing docs (demo script, business-proposal outline, review reports)
 .agents/     This build's own working state (specs, status, decisions) — not
              required reading to use or run the app
 ```
