@@ -231,6 +231,13 @@ export function WorkloadForm({ open, workload, onClose, onSaved }: WorkloadFormP
           </label>
         </div>
 
+        <p className="-mt-1 text-xs text-[var(--color-muted)]">
+          Per-category cheap-tier overrides (disable a category, raise a confidence floor, suppress a
+          pattern) are set via the API or{' '}
+          <code className="text-[var(--color-body)]">scripts/simulate_use_cases.py</code> for now, and
+          shown read-only in the table. Editing here preserves any that are already set.
+        </p>
+
         <div className="mt-2 flex justify-end gap-3">
           <button
             type="button"

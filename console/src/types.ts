@@ -15,16 +15,31 @@ export interface DashboardSummary {
   blocked_count: number
   findings_by_category: CategoryCount[]
   over_time: TimeBucket[]
+  // 8.4: p50/p95 of measured sync governance overhead (ms), or null on a
+  // fresh DB with no full-pipeline turns yet.
+  governance_overhead_p50_ms: number | null
+  governance_overhead_p95_ms: number | null
 }
 
 // Mirrors app/schemas/console.py's WorkloadOut/WorkloadCreate/WorkloadUpdate.
 export type PolicyProfile = 'strict' | 'balanced' | 'fast'
 export type FailMode = 'fail_open' | 'fail_closed'
 
+// 8.6: per-category cheap-tier tuning, stored inside the free-form metadata
+// JSONB (no schema change). Set via the API / scripts/simulate_use_cases.py;
+// shown read-only in the Workloads table. See
+// .agents/prompts/8.6-per-workload-category-overrides-plan.md.
+export interface CategoryOverride {
+  enabled?: boolean
+  confidence_floor?: number
+  disabled_patterns?: string[]
+}
+
 export interface WorkloadMetadata {
   name?: string
   geography?: string
   industry?: string
+  category_overrides?: Record<string, CategoryOverride>
   [key: string]: unknown
 }
 
@@ -66,14 +81,24 @@ export interface FindingOut {
   category: string
   confidence: number
   evaluator_tier: string
-  evidence_ref: { side?: string; pattern?: string; span?: [number, number] } | null
+  // 8.5: masked_excerpt is the matched span blanked to [REDACTED:<category>]
+  // with ~40 chars of real context each side - present on any cheap-tier
+  // finding that carries a span. Never contains the raw match.
+  evidence_ref: {
+    side?: string
+    pattern?: string
+    span?: [number, number]
+    masked_excerpt?: string
+  } | null
   timestamp: string
 }
 
 // 8.2: clean/flagged/blocked - a fast-profile cheap-tier hit releases as
 // 200 with disposition=flagged instead of blocking (strict/balanced keep
 // hard-blocking). Replaces the old derived `blocked: boolean`.
-export type Disposition = 'clean' | 'flagged' | 'blocked'
+// 8.5: `redacted` - a balanced-profile response-side pii/custom_policy hit
+// where the matched span(s) were blanked and the edited response released.
+export type Disposition = 'clean' | 'flagged' | 'blocked' | 'redacted'
 
 export interface ExecutionOut {
   execution_id: string
@@ -83,6 +108,10 @@ export interface ExecutionOut {
   tool_loop_count: number
   execution_risk_score: number | null
   disposition: Disposition
+  // 8.4: the model this turn's request named, and the measured sync
+  // governance overhead in ms (null on a request-side block row / pre-8.4).
+  model: string | null
+  governance_overhead_ms: number | null
   created_at: string
   findings: FindingOut[]
 }
@@ -101,6 +130,7 @@ export interface FeedEntry {
   latency_ms: number | null
   execution_risk_score: number | null
   disposition: Disposition
+  model: string | null
   categories: string[]
   created_at: string
 }

@@ -78,13 +78,25 @@ export function Dashboard() {
 
         {state.status === 'ready' && (
           <div className="flex flex-col gap-6">
-            <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+            <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
               <StatTile label="Total requests" value={state.data.total_requests} />
               <StatTile
                 label="Blocked"
                 value={state.data.blocked_count}
                 accent
                 caveat="Escalation-only blocks (a session already in cooldown, no new content scanned) aren't included - Redis doesn't retain history for those past 15 minutes."
+              />
+              <StatTile
+                label="Governance overhead"
+                value={
+                  state.data.governance_overhead_p50_ms != null &&
+                  state.data.governance_overhead_p95_ms != null
+                    ? `${Math.round(state.data.governance_overhead_p50_ms)} / ${Math.round(
+                        state.data.governance_overhead_p95_ms,
+                      )} ms`
+                    : '— / — ms'
+                }
+                caveat="p50 / p95 of the synchronous interception path (cheap-tier scan + ledger read/write). The async judge runs after the response is released and isn't counted."
               />
             </div>
 

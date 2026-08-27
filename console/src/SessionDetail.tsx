@@ -38,21 +38,31 @@ function StrikeBadge({ category, count }: { category: string; count: number }) {
 }
 
 function FindingRow({ finding }: { finding: FindingOut }) {
+  const maskedExcerpt = finding.evidence_ref?.masked_excerpt
   return (
-    <li className="flex flex-wrap items-center gap-3 border-t border-[var(--color-border)] px-4 py-3 text-sm first:border-t-0">
-      <span className="inline-block rounded-full border border-[var(--color-border)] px-2.5 py-0.5 text-xs text-[var(--color-body)]">
-        {finding.category}
-      </span>
-      <span className="text-[var(--color-muted)]">
-        confidence <span className="tabular-nums text-[var(--color-body)]">{finding.confidence.toFixed(2)}</span>
-      </span>
-      <span className="text-[var(--color-muted)]">
-        {finding.evaluator_tier} tier
-        {finding.evidence_ref?.side ? ` · ${finding.evidence_ref.side}` : ''}
-      </span>
-      <span className="ml-auto text-xs text-[var(--color-muted)]">
-        {new Date(finding.timestamp).toLocaleString()}
-      </span>
+    <li className="border-t border-[var(--color-border)] px-4 py-3 text-sm first:border-t-0">
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="inline-block rounded-full border border-[var(--color-border)] px-2.5 py-0.5 text-xs text-[var(--color-body)]">
+          {finding.category}
+        </span>
+        <span className="text-[var(--color-muted)]">
+          confidence <span className="tabular-nums text-[var(--color-body)]">{finding.confidence.toFixed(2)}</span>
+        </span>
+        <span className="text-[var(--color-muted)]">
+          {finding.evaluator_tier} tier
+          {finding.evidence_ref?.side ? ` · ${finding.evidence_ref.side}` : ''}
+        </span>
+        <span className="ml-auto text-xs text-[var(--color-muted)]">
+          {new Date(finding.timestamp).toLocaleString()}
+        </span>
+      </div>
+      {maskedExcerpt ? (
+        // 8.5: the text that tripped the rule, with the sensitive span
+        // already blanked. Never the raw match.
+        <p className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded-sm border border-[var(--color-border)] bg-[var(--color-canvas)] px-2.5 py-1.5 font-mono text-xs text-[var(--color-muted)]">
+          {maskedExcerpt}
+        </p>
+      ) : null}
     </li>
   )
 }
@@ -63,11 +73,17 @@ function ExecutionCard({ execution, index }: { execution: ExecutionOut; index: n
       <div className="flex flex-wrap items-center gap-4 px-4 py-3">
         <span className="text-sm font-medium text-[var(--color-ink)]">Turn {index + 1}</span>
         <DispositionBadge disposition={execution.disposition} />
+        {execution.model ? (
+          <span className="inline-block rounded-sm border border-[var(--color-border)] px-1.5 py-0.5 font-mono text-xs text-[var(--color-body)]">
+            {execution.model}
+          </span>
+        ) : null}
         <span className="text-sm text-[var(--color-muted)]">
           {execution.tokens != null ? `${execution.tokens.toLocaleString()} tokens` : 'no model call'}
-        </span>
-        <span className="text-sm text-[var(--color-muted)]">
-          {execution.latency_ms != null ? `${execution.latency_ms.toLocaleString()} ms` : null}
+          {execution.latency_ms != null ? ` · ${execution.latency_ms.toLocaleString()} ms` : ''}
+          {execution.governance_overhead_ms != null
+            ? ` · ${execution.governance_overhead_ms.toLocaleString()} ms governance`
+            : ''}
         </span>
         <span className="ml-auto text-xs text-[var(--color-muted)]">
           {new Date(execution.created_at).toLocaleString()}

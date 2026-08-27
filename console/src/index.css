@@ -18,6 +18,11 @@
   --color-success: #34d399;
   --color-warning: #fbbf24;
   --color-error: #f87171;
+  /* 8.5: DispositionBadge 'Redacted' state - a violet distinct from
+     --color-accent sky blue and from the three status colors above.
+     #A78BFA on canvas #0A0F14: ~7.1:1 (the word carries the meaning,
+     color reinforces). Verified before writing here, per design.md. */
+  --color-info: #a78bfa;
 
   --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
 

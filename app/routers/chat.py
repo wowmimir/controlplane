@@ -31,6 +31,7 @@ from app.db import async_session, get_db
 from app.evaluators.cheap import run_cheap_tier
 from app.evaluators.expensive import run_expensive_tier
 from app.evaluators.medium import run_medium_tier
+from app.evaluators.redact import REDACTABLE_CATEGORIES, masked_excerpt, redact_spans
 from app.evaluators.types import FindingCandidate
 from app.model_client import ModelCallError, call_model
 from app.models import (
@@ -88,6 +89,20 @@ async def chat_completions(
     response.headers["X-Workload-Id"] = str(workload.workload_id)
     response.headers["X-Session-Id"] = str(session.session_id)
 
+    # 8.5: the text the request-side cheap tier scanned (the newest turn only,
+    # per the 8.0 fix) - reused as the source for any deferred request-side
+    # Finding's masked_excerpt, built on the Execution row chat_completions
+    # creates once the model call concludes.
+    request_text = request.messages[-1].content if request.messages else ""
+
+    # 8.4: time the interception function calls (cheap-tier scan + the Redis/
+    # Postgres ledger I/O inside them) as the measured governance overhead for
+    # this turn. req_ms alone lands on the model-failure row; req_ms + resp_ms
+    # lands on the released row. A request-side block row keeps NULL - it is
+    # built inside _run_request_side_interception, before this timer stops,
+    # and chat_completions has no handle to it (deliberate scope choice, see
+    # .agents/prompts/8.4-multi-use-case-simulation-plan.md).
+    req_start = time.perf_counter()
     try:
         blocked, request_flags = await _run_request_side_interception(db, session, workload, request)
     except Exception:
@@ -96,6 +111,7 @@ async def chat_completions(
         )
         blocked = _internal_error_response() if workload.fail_mode == FailMode.fail_closed else None
         request_flags = []
+    req_ms = (time.perf_counter() - req_start) * 1000
     if blocked is not None:
         blocked.headers["X-Workload-Id"] = str(workload.workload_id)
         blocked.headers["X-Session-Id"] = str(session.session_id)
@@ -121,6 +137,11 @@ async def chat_completions(
             # whether the model call then succeeded - it still gets logged
             # against this turn's Execution row.
             disposition=Disposition.flagged if request_flags else Disposition.clean,
+            # 8.4: model always known (request.model is required);
+            # governance overhead is request-side elapsed only - no
+            # response-side interception ran on a failed call.
+            model=request.model,
+            governance_overhead_ms=round(req_ms),
         )
         db.add(failed_execution)
         await db.flush()
@@ -131,7 +152,7 @@ async def chat_completions(
                     category=candidate.category,
                     confidence=candidate.confidence,
                     evaluator_tier=EvaluatorTier.cheap,
-                    evidence_ref={"side": "request", **(candidate.evidence_ref or {})},
+                    evidence_ref=_finding_evidence("request", candidate, request_text),
                 )
             )
         await db.commit()
@@ -152,6 +173,9 @@ async def chat_completions(
         # row (the one real Execution for this model-call attempt), never a
         # second standalone row - see _run_request_side_interception.
         disposition=Disposition.flagged if request_flags else Disposition.clean,
+        # 8.4: governance_overhead_ms is set below, after response-side
+        # interception has run and been timed (req_ms + resp_ms).
+        model=request.model,
     )
     db.add(execution)
     # 7.1/M1: commit immediately, not just flush - this row must exist in
@@ -172,11 +196,12 @@ async def chat_completions(
                 category=candidate.category,
                 confidence=candidate.confidence,
                 evaluator_tier=EvaluatorTier.cheap,
-                evidence_ref={"side": "request", **(candidate.evidence_ref or {})},
+                evidence_ref=_finding_evidence("request", candidate, request_text),
             )
         )
     await db.commit()
 
+    resp_start = time.perf_counter()
     try:
         blocked = await _run_response_side_interception(
             db, session, execution, parsed, workload, request, background_tasks
@@ -186,6 +211,24 @@ async def chat_completions(
             "response-side interception failed for session %s", session.session_id, exc_info=True
         )
         blocked = _internal_error_response() if workload.fail_mode == FailMode.fail_closed else None
+    resp_ms = (time.perf_counter() - resp_start) * 1000
+
+    # 8.4: stamp the measured total (request-side + response-side interception
+    # wall-clock) onto the already-durable Execution row - a plain UPDATE. Best
+    # effort: a metric write must never fail an otherwise-complete request, so
+    # a commit failure here (e.g. the session left in a bad state by a raised
+    # response-side interception) is logged and swallowed, leaving the column
+    # NULL for this row. See .agents/prompts/8.4-multi-use-case-simulation-plan.md.
+    try:
+        execution.governance_overhead_ms = round(req_ms + resp_ms)
+        await db.commit()
+    except Exception:
+        logger.error(
+            "governance_overhead_ms write failed for execution %s",
+            execution.execution_id,
+            exc_info=True,
+        )
+
     if blocked is not None:
         blocked.headers["X-Workload-Id"] = str(workload.workload_id)
         blocked.headers["X-Session-Id"] = str(session.session_id)
@@ -407,6 +450,37 @@ async def _safe_ledger_update(
         return None
 
 
+def _finding_evidence(
+    side: Literal["request", "response"],
+    candidate: FindingCandidate,
+    scanned_text: str,
+) -> dict:
+    """8.5: the `evidence_ref` dict for a cheap-tier Finding - the evaluator's
+    own `{pattern, span}` plus `side`, plus a `masked_excerpt` (the matched
+    span blanked, with ~40 chars of real context each side) whenever the
+    candidate carries a span. No raw sensitive text is ever persisted; the
+    excerpt already has the span blanked. Replaces the inline
+    `{"side": ..., **(candidate.evidence_ref or {})}` literal at every
+    cheap-tier write site. See .agents/prompts/8.5-redact-and-release-plan.md.
+    """
+    ref = {"side": side, **(candidate.evidence_ref or {})}
+    span = ref.get("span")
+    if span is not None:
+        ref["masked_excerpt"] = masked_excerpt(scanned_text, span, candidate.category)
+    return ref
+
+
+def _category_overrides(workload: Workload) -> dict | None:
+    """8.6: the workload's per-category cheap-tier override map, if any, out
+    of its free-form `metadata` JSONB. Passed straight to `run_cheap_tier`,
+    which skips a disabled category, drops matches below a `confidence_floor`,
+    and drops patterns in `disabled_patterns` (the 8.3 Detection Health
+    hook). Absent map / absent key -> pre-8.6 behavior. See
+    .agents/prompts/8.6-per-workload-category-overrides-plan.md.
+    """
+    return (workload.metadata_ or {}).get("category_overrides")
+
+
 async def _run_request_side_interception(
     db: AsyncSession, session: Session, workload: Workload, request: ChatCompletionRequest
 ) -> tuple[JSONResponse | None, list[FindingCandidate]]:
@@ -456,6 +530,10 @@ async def _run_request_side_interception(
             workload_id=workload.workload_id,
             disposition=Disposition.blocked,
             execution_risk_score=None,
+            # 8.4: model is from the request; governance_overhead_ms stays
+            # NULL - this row is built here, inside the interception function,
+            # before chat_completions's outer timer stops.
+            model=request.model,
         )
         db.add(escalation_execution)
         await db.commit()
@@ -468,7 +546,10 @@ async def _run_request_side_interception(
     # Finding/strike on old content still present in later turns. See
     # .agents/prompts/8.0-fix-request-side-full-history-rescan-plan.md.
     text = request.messages[-1].content if request.messages else ""
-    candidates = run_cheap_tier(text)
+    # 8.6: this workload's per-category cheap-tier tuning (disable / confidence
+    # floor / suppressed patterns), read from Workload.metadata. None for a
+    # workload with no override map -> identical to pre-8.6.
+    candidates = run_cheap_tier(text, _category_overrides(workload))
     if not candidates:
         return None, []
 
@@ -489,6 +570,9 @@ async def _run_request_side_interception(
         workload_id=workload.workload_id,
         disposition=Disposition.blocked,
         execution_risk_score=execution_risk_score,
+        # 8.4: as with the escalation row above - model recorded,
+        # governance_overhead_ms left NULL on a request-side block.
+        model=request.model,
     )
     db.add(execution)
     await db.flush()
@@ -500,7 +584,7 @@ async def _run_request_side_interception(
                 category=candidate.category,
                 confidence=candidate.confidence,
                 evaluator_tier=EvaluatorTier.cheap,
-                evidence_ref={"side": "request", **(candidate.evidence_ref or {})},
+                evidence_ref=_finding_evidence("request", candidate, text),
             )
         )
     await db.commit()
@@ -611,17 +695,45 @@ async def _run_response_side_interception(
     # conversation context. Ratified scope cut, not an oversight - see
     # .agents/prompts/8.0-fix-request-side-full-history-rescan-plan.md.
     context_text = "\n".join(message.content for message in request.messages)
-    cheap_candidates = run_cheap_tier(response_text)
+    # 8.6: same per-category override map as the request side (see
+    # _category_overrides / _run_request_side_interception).
+    cheap_candidates = run_cheap_tier(response_text, _category_overrides(workload))
 
     if cheap_candidates:
-        # 8.2: strict/balanced keep hard-blocking exactly as before this
-        # milestone; fast flags instead - the response still releases, but
-        # the hit is logged (real Finding, real ledger update) for review.
-        disposition = (
-            Disposition.flagged if workload.policy_profile == PolicyProfile.fast else Disposition.blocked
+        # 8.2: strict/balanced kept hard-blocking; fast flags (releases 200).
+        # 8.5: balanced now REDACTS and releases 200 when every cheap-tier
+        # candidate is pii/custom_policy - the only categories whose span
+        # points at sensitive data rather than at trigger phrasing. Any
+        # non-redactable candidate present (toxicity/bias/prompt_injection)
+        # -> balanced hard-blocks the whole response, unchanged (releasing a
+        # response that still carries a known-bad finding, just with the PII
+        # blanked, would be releasing known-bad content). strict always
+        # blocks; fast always flags, unredacted. See
+        # .agents/prompts/8.5-redact-and-release-plan.md.
+        redactable = all(
+            candidate.category in REDACTABLE_CATEGORIES for candidate in cheap_candidates
         )
+        if workload.policy_profile == PolicyProfile.fast:
+            disposition = Disposition.flagged
+        elif workload.policy_profile == PolicyProfile.balanced and redactable:
+            disposition = Disposition.redacted
+        else:
+            disposition = Disposition.blocked
+
         execution.disposition = disposition
         execution.execution_risk_score = max(candidate.confidence for candidate in cheap_candidates)
+
+        # Build the edited body from the ORIGINAL response_text and all
+        # candidate spans (offsets are into the pre-redaction text; applied
+        # once, right-to-left, from this single scan result - never
+        # re-scanned).
+        redacted_text = None
+        if disposition == Disposition.redacted:
+            redacted_text = redact_spans(
+                response_text,
+                [(candidate.evidence_ref["span"], candidate.category) for candidate in cheap_candidates],
+            )
+
         for candidate in cheap_candidates:
             db.add(
                 Finding(
@@ -629,12 +741,19 @@ async def _run_response_side_interception(
                     category=candidate.category,
                     confidence=candidate.confidence,
                     evaluator_tier=EvaluatorTier.cheap,
-                    evidence_ref={"side": "response", **(candidate.evidence_ref or {})},
+                    # masked_excerpt is drawn from the original response_text,
+                    # never from redacted_text.
+                    evidence_ref=_finding_evidence("response", candidate, response_text),
                 )
             )
         await db.commit()
 
         ts_anchor = time.time()
+        # Ledger accrual on a redacted turn is identical to a block: the model
+        # did emit PII, and a session whose model keeps leaking it should
+        # still escalate. The judge is scheduled with the pre-redaction text
+        # (its grounding is unchanged; it is post-release and cannot affect
+        # this turn anyway, per Fork #4).
         ledger = await _safe_ledger_update(
             db,
             session,
@@ -646,6 +765,9 @@ async def _run_response_side_interception(
             context_text, response_text, workload, ledger, ts_anchor,
         )
 
+        if disposition == Disposition.redacted:
+            parsed.choices[0].message.content = redacted_text
+            return None  # release the edited 200
         if disposition == Disposition.blocked:
             return _policy_block_response("response", cheap_candidates)
         return None  # flagged: release the already-computed response as 200
@@ -714,7 +836,9 @@ async def _run_response_side_interception(
                 category=candidate.category,
                 confidence=candidate.confidence,
                 evaluator_tier=EvaluatorTier.medium,
-                evidence_ref={"side": "response", **(candidate.evidence_ref or {})},
+                # 8.5: same helper for consistency; a medium candidate may
+                # carry no span, in which case no masked_excerpt key is added.
+                evidence_ref=_finding_evidence("response", candidate, response_text),
             )
         )
     await db.commit()

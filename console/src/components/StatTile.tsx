@@ -1,6 +1,7 @@
 interface StatTileProps {
   label: string
-  value: number
+  // 8.4: strings allowed too, for a composite value like "3 / 9 ms".
+  value: number | string
   accent?: boolean
   caveat?: string
 }
@@ -15,7 +16,7 @@ export function StatTile({ label, value, accent = false, caveat }: StatTileProps
             accent ? 'text-[var(--color-accent)]' : 'text-[var(--color-ink)]'
           }`}
         >
-          {value.toLocaleString()}
+          {typeof value === 'number' ? value.toLocaleString() : value}
         </dd>
       </dl>
       {caveat ? <p className="mt-3 text-sm text-[var(--color-muted)]">{caveat}</p> : null}

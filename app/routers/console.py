@@ -107,6 +107,20 @@ async def get_summary(db: AsyncSession = Depends(get_db)) -> DashboardSummary:
         or 0
     )
 
+    # 8.4: p50/p95 of the measured sync governance overhead, all-time (same
+    # framing as blocked_count; the 24h over_time window is a separate
+    # concern). Computed over rows that actually have a measured value -
+    # request-side block rows (governance_overhead_ms IS NULL) and pre-8.4
+    # rows are excluded, which is exactly the population the business
+    # proposal's latency claim is about. (None, None) on a fresh DB.
+    overhead_row = await db.execute(
+        select(
+            func.percentile_cont(0.5).within_group(Execution.governance_overhead_ms.asc()),
+            func.percentile_cont(0.95).within_group(Execution.governance_overhead_ms.asc()),
+        ).where(Execution.governance_overhead_ms.isnot(None))
+    )
+    governance_overhead_p50_ms, governance_overhead_p95_ms = overhead_row.one()
+
     category_rows = await db.execute(select(Finding.category, func.count()).group_by(Finding.category))
     findings_by_category = [
         CategoryCount(category=category.value, count=count) for category, count in category_rows.all()
@@ -152,6 +166,8 @@ async def get_summary(db: AsyncSession = Depends(get_db)) -> DashboardSummary:
         blocked_count=blocked_count,
         findings_by_category=findings_by_category,
         over_time=over_time,
+        governance_overhead_p50_ms=governance_overhead_p50_ms,
+        governance_overhead_p95_ms=governance_overhead_p95_ms,
     )
 
 
@@ -276,6 +292,8 @@ async def get_session_detail(
             tool_loop_count=execution.tool_loop_count,
             execution_risk_score=execution.execution_risk_score,
             disposition=execution.disposition.value,
+            model=execution.model,
+            governance_overhead_ms=execution.governance_overhead_ms,
             created_at=execution.created_at,
             findings=[
                 FindingOut(
@@ -339,6 +357,7 @@ async def get_feed(db: AsyncSession = Depends(get_db)) -> list[FeedEntry]:
             latency_ms=execution.latency_ms,
             execution_risk_score=execution.execution_risk_score,
             disposition=execution.disposition.value,
+            model=execution.model,
             categories=sorted(
                 {finding.category.value for finding in findings_by_execution[execution.execution_id]}
             ),

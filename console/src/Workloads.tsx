@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { fetchWorkloads } from './api'
 import { WorkloadForm } from './components/WorkloadForm'
-import { displayId } from './lib/format'
+import { displayId, formatCategoryOverrides } from './lib/format'
 import type { Workload } from './types'
 
 type LoadState =
@@ -100,7 +100,7 @@ export function Workloads() {
 
         {state.status === 'ready' && state.data.length > 0 && (
           <div className="overflow-x-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface)]">
-            <table className="w-full min-w-[720px] border-collapse text-left text-sm">
+            <table className="w-full min-w-[860px] border-collapse text-left text-sm">
               <thead>
                 <tr className="border-b border-[var(--color-border)] text-xs text-[var(--color-muted)]">
                   <th scope="col" className="px-4 py-3 font-medium">
@@ -117,6 +117,9 @@ export function Workloads() {
                   </th>
                   <th scope="col" className="px-4 py-3 font-medium">
                     Cost budget
+                  </th>
+                  <th scope="col" className="px-4 py-3 font-medium">
+                    Overrides
                   </th>
                   <th scope="col" className="px-4 py-3 font-medium">
                     Created
@@ -156,6 +159,9 @@ export function Workloads() {
                       {workload.cost_budget_per_request != null
                         ? `$${workload.cost_budget_per_request.toFixed(2)}`
                         : '—'}
+                    </td>
+                    <td className="px-4 py-3 text-[var(--color-body)]">
+                      {formatCategoryOverrides(workload.metadata) || '—'}
                     </td>
                     <td className="px-4 py-3 text-[var(--color-muted)]">
                       {new Date(workload.created_at).toLocaleDateString()}

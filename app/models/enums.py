@@ -37,9 +37,15 @@ class Disposition(str, enum.Enum):
     logged for review, released as 200 anyway. `blocked` - a hard 403,
     either a cheap-tier hit on a strict/balanced workload or a session-level
     escalation block (which has no Finding to point to, see Execution's own
-    docstring). See .agents/prompts/8.2-tiered-decision-logic-plan.md.
+    docstring). `redacted` (8.5) - a balanced-profile workload's response-side
+    hit where every cheap-tier candidate is `pii`/`custom_policy`: the matched
+    span(s) are blanked to `[REDACTED:<category>]` and the edited response is
+    released as 200, the rubric's fourth "edit" decision tier. See
+    .agents/prompts/8.2-tiered-decision-logic-plan.md and
+    .agents/prompts/8.5-redact-and-release-plan.md.
     """
 
     clean = "clean"
     flagged = "flagged"
     blocked = "blocked"
+    redacted = "redacted"
