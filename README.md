@@ -132,10 +132,13 @@ docs/        Human-facing docs (this project's demo script, review reports)
   attach — so it won't appear in the Dashboard, Session Drilldown, or Live
   Feed, even though it did block the request. Every other block type is
   fully visible.
-- **`policy_profile`, `latency_budget_ms`, and `cost_budget_per_request` are
-  recorded per workload and editable in the console, but not yet enforced.**
-  Nothing in the evaluation path reads them today — `fail_mode` is the only
-  `Workload` field that changes ControlPlane's behavior.
+- **`latency_budget_ms` and `cost_budget_per_request` are recorded per workload
+  but not enforced.** Nothing in the evaluation path reads their values today.
+  Every other `Workload` field does change behavior: `fail_mode` (fail open vs
+  closed), and — as of Phase 8 — `policy_profile` (escalation thresholds, the
+  block / redact / flag action a violation triggers, and how often the async
+  judge samples) and `metadata.category_overrides` (per-workload disable a
+  category, raise a confidence floor, or mute a noisy pattern).
 - **This is a hackathon-scope build.** There's no authentication on the
   `X-Workload-Id`/`X-Session-Id` headers (a caller can assert any session),
   nor on the console's write endpoints (`POST`/`PATCH /api/console/workloads`

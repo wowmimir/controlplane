@@ -164,6 +164,40 @@ export interface SessionDetail extends SessionSummary {
   executions: ExecutionOut[]
 }
 
+// 10.1: the prompt playground talks to POST /v1/chat/completions directly
+// (the OpenAI-shaped proxy entry point), not the /api/console/* surface the
+// types above mirror. See .agents/prompts/10.1-prompt-playground-page-plan.md.
+export interface ChatTurn {
+  role: 'user' | 'assistant'
+  content: string
+  // 10.1 review M2: a turn the proxy rejected (blocked / escalation-blocked).
+  // Shown in the transcript but NOT resent on the next turn - the proxy never
+  // produced a reply for it, and forwarding a blocked prompt to the model on a
+  // later turn contradicts the "blocked before the model is called" story.
+  blocked?: boolean
+}
+
+// The outcome of one /v1/chat/completions call, already classified by HTTP
+// status + error.type so the page never re-inspects the raw response.
+// - ok:        200, a model reply (clean / flagged / redacted all look the same
+//              here by design - a flagged release carries no body signal, a
+//              redacted one shows its [REDACTED:x] text inline).
+// - blocked:   403, controlplane_policy_violation - this turn's content.
+// - escalated: 403, controlplane_session_escalated - the session's accrued risk.
+// - error:     502/503/network - ControlPlane or the upstream model failed.
+export type ChatResult =
+  | { kind: 'ok'; content: string; sessionId: string | null }
+  | { kind: 'blocked'; message: string; code: string; sessionId: string | null }
+  | { kind: 'escalated'; message: string; sessionId: string | null }
+  // sessionId is carried here too: a 502 / fail-closed 503 still sets the
+  // X-Session-Id header and has already created a real Session row, so a
+  // first-turn upstream failure should not orphan that session (10.1 review).
+  | { kind: 'error'; message: string; sessionId: string | null }
+
+// The confirmed-working Ollama tag (decisions.md, 2026-08-23). Editable in the
+// playground; a Workload row stores no model of its own.
+export const DEFAULT_PLAYGROUND_MODEL = 'minimax-m3:cloud'
+
 // Mirrors app/schemas/console.py's FeedEntry.
 export interface FeedEntry {
   execution_id: string

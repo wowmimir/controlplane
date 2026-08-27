@@ -29,11 +29,19 @@ app = FastAPI(title="ControlPlane.ai", lifespan=lifespan)
 
 # Console (5.1+) is a separate Vite dev server (default origin below) calling
 # this API directly from the browser - per .agents/prompts/5.1-dashboard-plan.md.
+#
+# 10.1: expose_headers lets the browser's fetch() read the X-Session-Id /
+# X-Workload-Id response headers chat_completions sets on every reply (blocks
+# included). Without it those headers are hidden from cross-origin JS, so the
+# playground page could never thread a conversation across turns. Allowing the
+# POST method (above) is not the same as exposing response headers. See
+# .agents/prompts/10.1-prompt-playground-page-plan.md.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
     allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["X-Workload-Id", "X-Session-Id"],
 )
 
 app.include_router(chat_router)

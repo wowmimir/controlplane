@@ -1,4 +1,6 @@
 import type {
+  ChatResult,
+  ChatTurn,
   DashboardSummary,
   DetectionHealthPattern,
   FeedEntry,
@@ -111,4 +113,58 @@ export async function fetchFindings(params?: {
 export async function fetchDetectionHealth(): Promise<DetectionHealthPattern[]> {
   const response = await fetch(`${API_BASE_URL}/api/console/detection-health`)
   return parseOrThrow<DetectionHealthPattern[]>(response)
+}
+
+// 10.1: the playground's one call - POST to the OpenAI-shaped proxy entry
+// point, not /api/console/*. Deliberately does NOT use parseOrThrow: the page
+// needs the 4xx/5xx body (the block reason, the category) as much as the 200
+// body, so every outcome comes back as a classified ChatResult, never a throw.
+// See .agents/prompts/10.1-prompt-playground-page-plan.md.
+export async function sendChatCompletion(params: {
+  model: string
+  messages: ChatTurn[]
+  workloadId?: string | null
+  sessionId?: string | null
+}): Promise<ChatResult> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (params.workloadId) headers['X-Workload-Id'] = params.workloadId
+  if (params.sessionId) headers['X-Session-Id'] = params.sessionId
+
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model: params.model, messages: params.messages }),
+    })
+  } catch {
+    return { kind: 'error', message: 'Could not reach ControlPlane.', sessionId: null }
+  }
+
+  // Requires app/main.py's CORS expose_headers (10.1) - null otherwise.
+  const sessionId = response.headers.get('X-Session-Id')
+  const body: unknown = await response.json().catch(() => null)
+  const record = (body ?? {}) as Record<string, unknown>
+
+  if (response.ok) {
+    const choices = record.choices as { message?: { content?: string } }[] | undefined
+    return { kind: 'ok', content: choices?.[0]?.message?.content ?? '', sessionId }
+  }
+
+  const err = (record.error ?? {}) as { message?: string; type?: string; code?: string }
+  // The proxy's own blocks use the OpenAI-shaped { error: {...} } envelope;
+  // FastAPI HTTPException paths (unknown workload, cross-workload session id -
+  // app/routers/chat.py) return { detail: "..." } instead. Fall back to that
+  // so a workload-mismatch 400 explains itself rather than showing a bare code.
+  const message =
+    err.message ??
+    (typeof record.detail === 'string' ? record.detail : null) ??
+    `ControlPlane returned ${response.status}.`
+  if (response.status === 403 && err.type === 'controlplane_session_escalated') {
+    return { kind: 'escalated', message, sessionId }
+  }
+  if (response.status === 403) {
+    return { kind: 'blocked', message, code: err.code ?? 'policy_violation', sessionId }
+  }
+  return { kind: 'error', message, sessionId }
 }

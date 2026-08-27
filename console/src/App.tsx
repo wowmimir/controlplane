@@ -2,6 +2,7 @@ import { NavLink, Route, Routes } from 'react-router-dom'
 import { Dashboard } from './Dashboard'
 import { DetectionHealth } from './DetectionHealth'
 import { LiveFeed } from './LiveFeed'
+import { Playground } from './Playground'
 import { ReviewQueue } from './ReviewQueue'
 import { SessionDetail } from './SessionDetail'
 import { Sessions } from './Sessions'
@@ -40,6 +41,9 @@ function App() {
             <NavLink to="/feed" className={navLinkClass}>
               Live Feed
             </NavLink>
+            <NavLink to="/playground" className={navLinkClass}>
+              Playground
+            </NavLink>
           </nav>
         </div>
       </header>
@@ -52,6 +56,7 @@ function App() {
         <Route path="/review" element={<ReviewQueue />} />
         <Route path="/detection-health" element={<DetectionHealth />} />
         <Route path="/feed" element={<LiveFeed />} />
+        <Route path="/playground" element={<Playground />} />
       </Routes>
 
       <footer className="mx-auto max-w-6xl px-6 py-6 text-xs text-[var(--color-muted)]">
