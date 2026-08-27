@@ -98,6 +98,19 @@ export function Dashboard() {
                 }
                 caveat="p50 / p95 of the synchronous interception path (cheap-tier scan + ledger read/write). The async judge runs after the response is released and isn't counted."
               />
+              <StatTile
+                label="False-positive rate"
+                value={
+                  state.data.false_positive_rate != null
+                    ? `${Math.round(state.data.false_positive_rate * 100)}%`
+                    : '—'
+                }
+                caveat={
+                  state.data.reviewed_findings > 0
+                    ? `Of reviewed findings only. ${state.data.false_positive_findings} of ${state.data.reviewed_findings} reviewed findings were marked a false positive; the unreviewed backlog is not in the denominator.`
+                    : 'Of reviewed findings only. Nothing has been reviewed yet — confirm or reject findings on a session or the Review page and this starts to fill in.'
+                }
+              />
             </div>
 
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">

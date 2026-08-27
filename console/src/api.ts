@@ -1,6 +1,10 @@
 import type {
   DashboardSummary,
+  DetectionHealthPattern,
   FeedEntry,
+  FindingOut,
+  ReviewQueueEntry,
+  ReviewStatus,
   SessionDetail,
   SessionSummary,
   Workload,
@@ -75,4 +79,36 @@ export async function fetchSessionDetail(sessionId: string): Promise<SessionDeta
 export async function fetchFeed(): Promise<FeedEntry[]> {
   const response = await fetch(`${API_BASE_URL}/api/console/feed`)
   return parseOrThrow<FeedEntry[]>(response)
+}
+
+// 8.3: record an operator's judgment on a finding. Returns the updated finding.
+export async function patchFindingReview(
+  findingId: string,
+  reviewStatus: ReviewStatus,
+): Promise<FindingOut> {
+  const response = await fetch(`${API_BASE_URL}/api/console/findings/${findingId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ review_status: reviewStatus }),
+  })
+  return parseOrThrow<FindingOut>(response)
+}
+
+// 8.3: the review queue. Omit reviewStatus for all findings; pass it to filter.
+export async function fetchFindings(params?: {
+  reviewStatus?: ReviewStatus
+  limit?: number
+}): Promise<ReviewQueueEntry[]> {
+  const query = new URLSearchParams()
+  if (params?.reviewStatus) query.set('review_status', params.reviewStatus)
+  if (params?.limit != null) query.set('limit', String(params.limit))
+  const suffix = query.toString() ? `?${query.toString()}` : ''
+  const response = await fetch(`${API_BASE_URL}/api/console/findings${suffix}`)
+  return parseOrThrow<ReviewQueueEntry[]>(response)
+}
+
+// 8.3: per-pattern false-positive rates + which workloads suppress each.
+export async function fetchDetectionHealth(): Promise<DetectionHealthPattern[]> {
+  const response = await fetch(`${API_BASE_URL}/api/console/detection-health`)
+  return parseOrThrow<DetectionHealthPattern[]>(response)
 }

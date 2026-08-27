@@ -19,6 +19,12 @@ export interface DashboardSummary {
   // fresh DB with no full-pipeline turns yet.
   governance_overhead_p50_ms: number | null
   governance_overhead_p95_ms: number | null
+  // 8.3: the trust metric. reviewed_findings = confirmed + false_positive
+  // (unreviewed excluded); false_positive_rate is over that denominator, or
+  // null when nothing has been reviewed.
+  reviewed_findings: number
+  false_positive_findings: number
+  false_positive_rate: number | null
 }
 
 // Mirrors app/schemas/console.py's WorkloadOut/WorkloadCreate/WorkloadUpdate.
@@ -76,6 +82,9 @@ export interface SessionSummary {
   created_at: string
 }
 
+// 8.3: an operator's judgment on a finding.
+export type ReviewStatus = 'unreviewed' | 'confirmed' | 'false_positive'
+
 export interface FindingOut {
   finding_id: string
   category: string
@@ -91,6 +100,41 @@ export interface FindingOut {
     masked_excerpt?: string
   } | null
   timestamp: string
+  // 8.3: unreviewed / confirmed / false_positive.
+  review_status: ReviewStatus
+}
+
+// 8.3: one row of GET /api/console/findings - a finding plus enough context
+// to review it without opening its session.
+export interface ReviewQueueEntry {
+  finding_id: string
+  category: string
+  confidence: number
+  evaluator_tier: string
+  pattern: string | null
+  side: string | null
+  masked_excerpt: string | null
+  review_status: ReviewStatus
+  execution_id: string
+  disposition: Disposition
+  session_id: string
+  workload_id: string
+  workload_name: string | null
+  timestamp: string
+}
+
+// 8.3: one detection pattern's review outcomes, aggregated across every
+// workload, from GET /api/console/detection-health.
+export interface DetectionHealthPattern {
+  pattern: string
+  category: string
+  confirmed: number
+  false_positive: number
+  unreviewed: number
+  reviewed: number
+  false_positive_rate: number | null
+  needs_attention: boolean
+  suppressed_by: string[]
 }
 
 // 8.2: clean/flagged/blocked - a fast-profile cheap-tier hit releases as

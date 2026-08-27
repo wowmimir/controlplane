@@ -7,7 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
 from app.db import Base
-from app.models.enums import EvaluatorTier, FindingCategory
+from app.models.enums import EvaluatorTier, FindingCategory, ReviewStatus
 
 
 class Finding(Base):
@@ -31,4 +31,14 @@ class Finding(Base):
     evidence_ref: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # 8.3: operator judgment on this finding. Defaults to `unreviewed`; the
+    # PATCH /api/console/findings/{id} endpoint is the only writer. Added to
+    # the existing `finding` table via a manual ALTER TABLE (create_all does
+    # not alter existing tables) - see the 8.3 spec's Build plan step 1.
+    review_status: Mapped[ReviewStatus] = mapped_column(
+        Enum(ReviewStatus, name="review_status"),
+        nullable=False,
+        default=ReviewStatus.unreviewed,
+        server_default=ReviewStatus.unreviewed.value,
     )

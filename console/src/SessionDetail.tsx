@@ -2,8 +2,14 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { fetchSessionDetail, NotFoundError } from './api'
 import { DispositionBadge } from './components/DispositionBadge'
+import { ReviewControls } from './components/ReviewControls'
 import { displayId, isLedgerLive } from './lib/format'
-import type { ExecutionOut, FindingOut, SessionDetail as SessionDetailData } from './types'
+import type {
+  ExecutionOut,
+  FindingOut,
+  ReviewStatus,
+  SessionDetail as SessionDetailData,
+} from './types'
 
 type LoadState =
   | { status: 'loading' }
@@ -37,7 +43,13 @@ function StrikeBadge({ category, count }: { category: string; count: number }) {
   )
 }
 
-function FindingRow({ finding }: { finding: FindingOut }) {
+function FindingRow({
+  finding,
+  onReviewed,
+}: {
+  finding: FindingOut
+  onReviewed: (status: ReviewStatus) => void
+}) {
   const maskedExcerpt = finding.evidence_ref?.masked_excerpt
   return (
     <li className="border-t border-[var(--color-border)] px-4 py-3 text-sm first:border-t-0">
@@ -56,6 +68,13 @@ function FindingRow({ finding }: { finding: FindingOut }) {
           {new Date(finding.timestamp).toLocaleString()}
         </span>
       </div>
+      <div className="mt-2">
+        <ReviewControls
+          findingId={finding.finding_id}
+          reviewStatus={finding.review_status}
+          onReviewed={onReviewed}
+        />
+      </div>
       {maskedExcerpt ? (
         // 8.5: the text that tripped the rule, with the sensitive span
         // already blanked. Never the raw match.
@@ -67,7 +86,15 @@ function FindingRow({ finding }: { finding: FindingOut }) {
   )
 }
 
-function ExecutionCard({ execution, index }: { execution: ExecutionOut; index: number }) {
+function ExecutionCard({
+  execution,
+  index,
+  onReviewed,
+}: {
+  execution: ExecutionOut
+  index: number
+  onReviewed: (findingId: string, status: ReviewStatus) => void
+}) {
   return (
     <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-surface)]">
       <div className="flex flex-wrap items-center gap-4 px-4 py-3">
@@ -92,7 +119,11 @@ function ExecutionCard({ execution, index }: { execution: ExecutionOut; index: n
       {execution.findings.length > 0 ? (
         <ul>
           {execution.findings.map((finding) => (
-            <FindingRow key={finding.finding_id} finding={finding} />
+            <FindingRow
+              key={finding.finding_id}
+              finding={finding}
+              onReviewed={(status) => onReviewed(finding.finding_id, status)}
+            />
           ))}
         </ul>
       ) : (
@@ -128,6 +159,26 @@ export function SessionDetail() {
   useEffect(() => {
     load()
   }, [load])
+
+  const handleReviewed = useCallback((findingId: string, status: ReviewStatus) => {
+    setState((prev) => {
+      if (prev.status !== 'ready') return prev
+      return {
+        ...prev,
+        data: {
+          ...prev.data,
+          executions: prev.data.executions.map((execution) => ({
+            ...execution,
+            findings: execution.findings.map((finding) =>
+              finding.finding_id === findingId
+                ? { ...finding, review_status: status }
+                : finding,
+            ),
+          })),
+        },
+      }
+    })
+  }, [])
 
   return (
     <>
@@ -255,7 +306,12 @@ export function SessionDetail() {
               ) : (
                 <div className="flex flex-col gap-3">
                   {state.data.executions.map((execution, index) => (
-                    <ExecutionCard key={execution.execution_id} execution={execution} index={index} />
+                    <ExecutionCard
+                      key={execution.execution_id}
+                      execution={execution}
+                      index={index}
+                      onReviewed={handleReviewed}
+                    />
                   ))}
                 </div>
               )}

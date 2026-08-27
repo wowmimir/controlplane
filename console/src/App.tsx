@@ -1,6 +1,8 @@
 import { NavLink, Route, Routes } from 'react-router-dom'
 import { Dashboard } from './Dashboard'
+import { DetectionHealth } from './DetectionHealth'
 import { LiveFeed } from './LiveFeed'
+import { ReviewQueue } from './ReviewQueue'
 import { SessionDetail } from './SessionDetail'
 import { Sessions } from './Sessions'
 import { Workloads } from './Workloads'
@@ -29,6 +31,12 @@ function App() {
             <NavLink to="/sessions" className={navLinkClass}>
               Sessions
             </NavLink>
+            <NavLink to="/review" className={navLinkClass}>
+              Review
+            </NavLink>
+            <NavLink to="/detection-health" className={navLinkClass}>
+              Detection Health
+            </NavLink>
             <NavLink to="/feed" className={navLinkClass}>
               Live Feed
             </NavLink>
@@ -41,6 +49,8 @@ function App() {
         <Route path="/workloads" element={<Workloads />} />
         <Route path="/sessions" element={<Sessions />} />
         <Route path="/sessions/:sessionId" element={<SessionDetail />} />
+        <Route path="/review" element={<ReviewQueue />} />
+        <Route path="/detection-health" element={<DetectionHealth />} />
         <Route path="/feed" element={<LiveFeed />} />
       </Routes>
 

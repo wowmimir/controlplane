@@ -4,7 +4,14 @@ Importing this package registers every model on Base.metadata, which is what
 app/main.py's startup create_all relies on.
 """
 
-from app.models.enums import Disposition, EvaluatorTier, FailMode, FindingCategory, PolicyProfile
+from app.models.enums import (
+    Disposition,
+    EvaluatorTier,
+    FailMode,
+    FindingCategory,
+    PolicyProfile,
+    ReviewStatus,
+)
 from app.models.execution import Execution
 from app.models.finding import Finding
 from app.models.session import Session
@@ -16,6 +23,7 @@ __all__ = [
     "FailMode",
     "FindingCategory",
     "PolicyProfile",
+    "ReviewStatus",
     "Execution",
     "Finding",
     "Session",

@@ -10,7 +10,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from app.models.enums import FailMode, PolicyProfile
+from app.models.enums import FailMode, PolicyProfile, ReviewStatus
 
 
 class CategoryCount(BaseModel):
@@ -33,6 +33,14 @@ class DashboardSummary(BaseModel):
     # measured value (the full sync-pipeline turns). null on a fresh DB.
     governance_overhead_p50_ms: float | None
     governance_overhead_p95_ms: float | None
+    # 8.3: the trust metric. `reviewed_findings` = confirmed + false_positive
+    # (unreviewed excluded); `false_positive_rate` = false_positive /
+    # reviewed_findings, or null when nothing has been reviewed. Labeled "of
+    # reviewed findings" in the console so an unreviewed backlog can't read as
+    # a misleading ~0%.
+    reviewed_findings: int
+    false_positive_findings: int
+    false_positive_rate: float | None
 
 
 class WorkloadOut(BaseModel):
@@ -80,6 +88,52 @@ class FindingOut(BaseModel):
     evaluator_tier: str
     evidence_ref: dict | None
     timestamp: datetime
+    # 8.3: operator judgment - unreviewed / confirmed / false_positive.
+    review_status: str
+
+
+class FindingReviewUpdate(BaseModel):
+    """8.3: body of PATCH /api/console/findings/{finding_id}. Any of the three
+    values is accepted, and any transition is allowed (including back to
+    unreviewed)."""
+
+    review_status: ReviewStatus
+
+
+class ReviewQueueEntry(BaseModel):
+    """8.3: one row of GET /api/console/findings - a finding plus enough
+    context to review it without opening its session."""
+
+    finding_id: uuid.UUID
+    category: str
+    confidence: float
+    evaluator_tier: str
+    pattern: str | None
+    side: str | None
+    masked_excerpt: str | None
+    review_status: str
+    execution_id: uuid.UUID
+    disposition: str
+    session_id: uuid.UUID
+    workload_id: uuid.UUID
+    workload_name: str | None
+    timestamp: datetime
+
+
+class DetectionHealthPattern(BaseModel):
+    """8.3: one detection pattern's review outcomes, aggregated across every
+    workload. `pattern` is `evidence_ref->>'pattern'` for cheap-tier findings,
+    or `<category>:<tier>` for findings without one (the expensive-tier judge)."""
+
+    pattern: str
+    category: str
+    confirmed: int
+    false_positive: int
+    unreviewed: int
+    reviewed: int
+    false_positive_rate: float | None
+    needs_attention: bool
+    suppressed_by: list[uuid.UUID]
 
 
 class ExecutionOut(BaseModel):

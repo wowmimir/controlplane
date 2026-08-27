@@ -45,19 +45,30 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
-from app.models import Disposition, Execution, Finding, PolicyProfile, Session, Workload
+from app.models import (
+    Disposition,
+    Execution,
+    Finding,
+    PolicyProfile,
+    ReviewStatus,
+    Session,
+    Workload,
+)
 from app.redis_client import is_escalated
 from app.schemas.console import (
     CategoryCount,
     DashboardSummary,
+    DetectionHealthPattern,
     ExecutionOut,
     FeedEntry,
     FindingOut,
+    FindingReviewUpdate,
+    ReviewQueueEntry,
     SessionDetail,
     SessionSummary,
     TimeBucket,
@@ -68,6 +79,15 @@ from app.schemas.console import (
 
 SESSION_LIST_LIMIT = 50
 FEED_LIMIT = 25
+FINDINGS_LIST_LIMIT_DEFAULT = 100
+FINDINGS_LIST_LIMIT_MAX = 500
+
+# 8.3: a detection pattern is flagged "needs attention" when it was a false
+# positive in at least this share of the findings a human actually reviewed,
+# over at least this many reviewed findings. Tuning knobs for the demo, not a
+# deployment setting - not env-configurable.
+DETECTION_HEALTH_FP_THRESHOLD = 0.30
+DETECTION_HEALTH_MIN_REVIEWED = 5
 
 
 def _workload_name(workload: Workload | None) -> str | None:
@@ -79,6 +99,46 @@ def _workload_name(workload: Workload | None) -> str | None:
 router = APIRouter(prefix="/api/console")
 
 OVER_TIME_WINDOW = timedelta(hours=24)
+
+
+def _to_finding_out(finding: Finding) -> FindingOut:
+    """8.3: the single place a Finding becomes a FindingOut. Extracted from the
+    inline build in get_session_detail so PATCH /findings/{id} returns the same
+    shape."""
+    return FindingOut(
+        finding_id=finding.finding_id,
+        category=finding.category.value,
+        confidence=finding.confidence,
+        evaluator_tier=finding.evaluator_tier.value,
+        evidence_ref=finding.evidence_ref,
+        timestamp=finding.timestamp,
+        review_status=finding.review_status.value,
+    )
+
+
+def _detection_pattern_key(finding_pattern: str | None, category: str, tier: str) -> str:
+    """8.3: how a finding is bucketed on the Detection Health page. Cheap-tier
+    findings all carry `evidence_ref['pattern']`; the expensive-tier judge does
+    not, so those bucket as `<category>:<tier>` (e.g. `hallucination:expensive`)."""
+    return finding_pattern or f"{category}:{tier}"
+
+
+def _workloads_suppressing(pattern: str, category: str, workloads: list[Workload]) -> list[uuid.UUID]:
+    """8.3: which workloads currently silence this pattern, read from 8.6's
+    `metadata.category_overrides[<category>].disabled_patterns`. Malformed
+    metadata is treated as "no suppression", matching 8.6."""
+    out: list[uuid.UUID] = []
+    for workload in workloads:
+        overrides = (workload.metadata_ or {}).get("category_overrides")
+        if not isinstance(overrides, dict):
+            continue
+        rule = overrides.get(category)
+        if not isinstance(rule, dict):
+            continue
+        disabled = rule.get("disabled_patterns")
+        if isinstance(disabled, (list, tuple)) and pattern in disabled:
+            out.append(workload.workload_id)
+    return out
 
 
 def _to_workload_out(workload: Workload) -> WorkloadOut:
@@ -126,6 +186,20 @@ async def get_summary(db: AsyncSession = Depends(get_db)) -> DashboardSummary:
         CategoryCount(category=category.value, count=count) for category, count in category_rows.all()
     ]
 
+    # 8.3: the trust metric. Denominator is confirmed + false_positive only -
+    # unreviewed findings are excluded so a review backlog can't dilute the
+    # rate toward a misleading ~0%. null when nothing has been reviewed.
+    review_rows = await db.execute(
+        select(Finding.review_status, func.count()).group_by(Finding.review_status)
+    )
+    review_counts = {status: count for status, count in review_rows.all()}
+    confirmed_findings = review_counts.get(ReviewStatus.confirmed, 0)
+    false_positive_findings = review_counts.get(ReviewStatus.false_positive, 0)
+    reviewed_findings = confirmed_findings + false_positive_findings
+    false_positive_rate = (
+        false_positive_findings / reviewed_findings if reviewed_findings else None
+    )
+
     window_start = datetime.now(timezone.utc) - OVER_TIME_WINDOW
 
     total_bucket_rows = await db.execute(
@@ -168,6 +242,9 @@ async def get_summary(db: AsyncSession = Depends(get_db)) -> DashboardSummary:
         over_time=over_time,
         governance_overhead_p50_ms=governance_overhead_p50_ms,
         governance_overhead_p95_ms=governance_overhead_p95_ms,
+        reviewed_findings=reviewed_findings,
+        false_positive_findings=false_positive_findings,
+        false_positive_rate=false_positive_rate,
     )
 
 
@@ -296,14 +373,7 @@ async def get_session_detail(
             governance_overhead_ms=execution.governance_overhead_ms,
             created_at=execution.created_at,
             findings=[
-                FindingOut(
-                    finding_id=finding.finding_id,
-                    category=finding.category.value,
-                    confidence=finding.confidence,
-                    evaluator_tier=finding.evaluator_tier.value,
-                    evidence_ref=finding.evidence_ref,
-                    timestamp=finding.timestamp,
-                )
+                _to_finding_out(finding)
                 for finding in findings_by_execution[execution.execution_id]
             ],
         )
@@ -325,6 +395,126 @@ async def get_session_detail(
         created_at=session.created_at,
         executions=execution_outs,
     )
+
+
+@router.patch("/findings/{finding_id}")
+async def update_finding_review(
+    finding_id: uuid.UUID,
+    body: FindingReviewUpdate,
+    db: AsyncSession = Depends(get_db),
+) -> FindingOut:
+    """8.3: record an operator's judgment on a finding. Any of the three
+    review_status values is accepted and any transition is allowed."""
+    finding = await db.get(Finding, finding_id)
+    if finding is None:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    finding.review_status = body.review_status
+    await db.commit()
+    await db.refresh(finding)
+    return _to_finding_out(finding)
+
+
+@router.get("/findings")
+async def list_findings(
+    review_status: ReviewStatus | None = None,
+    limit: int = Query(
+        default=FINDINGS_LIST_LIMIT_DEFAULT, gt=0, le=FINDINGS_LIST_LIMIT_MAX
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> list[ReviewQueueEntry]:
+    """8.3: the review queue. Every finding (optionally filtered to one
+    review_status), newest first, each carrying enough context to review it
+    without opening its session."""
+    query = (
+        select(Finding, Execution, Session, Workload)
+        .join(Execution, Execution.execution_id == Finding.execution_id)
+        .join(Session, Session.session_id == Execution.session_id)
+        .join(Workload, Workload.workload_id == Session.workload_id)
+        .order_by(Finding.timestamp.desc())
+        .limit(limit)
+    )
+    if review_status is not None:
+        query = query.where(Finding.review_status == review_status)
+
+    rows = await db.execute(query)
+    entries: list[ReviewQueueEntry] = []
+    for finding, execution, session, workload in rows.all():
+        evidence = finding.evidence_ref or {}
+        entries.append(
+            ReviewQueueEntry(
+                finding_id=finding.finding_id,
+                category=finding.category.value,
+                confidence=finding.confidence,
+                evaluator_tier=finding.evaluator_tier.value,
+                pattern=evidence.get("pattern"),
+                side=evidence.get("side"),
+                masked_excerpt=evidence.get("masked_excerpt"),
+                review_status=finding.review_status.value,
+                execution_id=execution.execution_id,
+                disposition=execution.disposition.value,
+                session_id=session.session_id,
+                workload_id=workload.workload_id,
+                workload_name=_workload_name(workload),
+                timestamp=finding.timestamp,
+            )
+        )
+    return entries
+
+
+@router.get("/detection-health")
+async def get_detection_health(
+    db: AsyncSession = Depends(get_db),
+) -> list[DetectionHealthPattern]:
+    """8.3: per-pattern review outcomes aggregated across every workload, plus
+    which workloads currently suppress each pattern. Sorted by false-positive
+    rate descending (nulls last)."""
+    rows = await db.execute(
+        select(
+            Finding.evidence_ref, Finding.category, Finding.evaluator_tier, Finding.review_status
+        )
+    )
+
+    # key -> {"category": str, "confirmed": int, "false_positive": int, "unreviewed": int}
+    buckets: dict[str, dict] = {}
+    for evidence_ref, category, tier, review_status in rows.all():
+        pattern = (evidence_ref or {}).get("pattern")
+        key = _detection_pattern_key(pattern, category.value, tier.value)
+        bucket = buckets.setdefault(
+            key,
+            {"category": category.value, "confirmed": 0, "false_positive": 0, "unreviewed": 0},
+        )
+        bucket[review_status.value] += 1
+
+    workloads = list((await db.execute(select(Workload))).scalars().all())
+
+    patterns: list[DetectionHealthPattern] = []
+    for key, bucket in buckets.items():
+        confirmed = bucket["confirmed"]
+        false_positive = bucket["false_positive"]
+        reviewed = confirmed + false_positive
+        fp_rate = false_positive / reviewed if reviewed else None
+        patterns.append(
+            DetectionHealthPattern(
+                pattern=key,
+                category=bucket["category"],
+                confirmed=confirmed,
+                false_positive=false_positive,
+                unreviewed=bucket["unreviewed"],
+                reviewed=reviewed,
+                false_positive_rate=fp_rate,
+                needs_attention=(
+                    fp_rate is not None
+                    and reviewed >= DETECTION_HEALTH_MIN_REVIEWED
+                    and fp_rate >= DETECTION_HEALTH_FP_THRESHOLD
+                ),
+                suppressed_by=_workloads_suppressing(key, bucket["category"], workloads),
+            )
+        )
+
+    patterns.sort(
+        key=lambda p: (p.false_positive_rate is None, -(p.false_positive_rate or 0.0), p.pattern)
+    )
+    return patterns
 
 
 @router.get("/feed")

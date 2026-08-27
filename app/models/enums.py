@@ -31,6 +31,20 @@ class FindingCategory(str, enum.Enum):
     custom_policy = "custom_policy"
 
 
+class ReviewStatus(str, enum.Enum):
+    """8.3: an operator's judgment on a Finding. `unreviewed` - nobody has
+    looked at it yet (the default for every finding, historical rows
+    included). `confirmed` - a real detection. `false_positive` - the pattern
+    fired on benign content. Feeds the Dashboard trust metric (false-positive
+    rate of reviewed findings) and Detection Health's per-pattern FP rate. See
+    .agents/prompts/8.3-finding-feedback-loop-plan.md.
+    """
+
+    unreviewed = "unreviewed"
+    confirmed = "confirmed"
+    false_positive = "false_positive"
+
+
 class Disposition(str, enum.Enum):
     """8.2: what ControlPlane actually decided about an Execution. `clean` -
     nothing found. `flagged` - a cheap-tier hit on a fast-profile workload;
