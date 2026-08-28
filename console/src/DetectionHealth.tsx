@@ -291,7 +291,7 @@ export function DetectionHealth() {
             A pattern is flagged "needs attention" at a false-positive rate of 30% or higher over at
             least 5 reviewed findings. Suppressing a pattern for a workload drops it before it
             becomes a finding there, so it stops blocking, striking, and showing up in that
-            workload's audit trail entirely — a real coverage cut the operator owns.
+            workload's audit trail entirely. That's a real cut in coverage, so use it deliberately.
           </p>
         ) : null}
       </main>

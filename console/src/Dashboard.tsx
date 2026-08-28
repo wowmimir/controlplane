@@ -108,7 +108,7 @@ export function Dashboard() {
                 caveat={
                   state.data.reviewed_findings > 0
                     ? `Of reviewed findings only. ${state.data.false_positive_findings} of ${state.data.reviewed_findings} reviewed findings were marked a false positive; the unreviewed backlog is not in the denominator.`
-                    : 'Of reviewed findings only. Nothing has been reviewed yet — confirm or reject findings on a session or the Review page and this starts to fill in.'
+                    : 'Of reviewed findings only. Nothing has been reviewed yet. Confirm or reject findings on a session or the Review page and this starts to fill in.'
                 }
               />
             </div>

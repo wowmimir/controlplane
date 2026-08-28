@@ -60,7 +60,7 @@ function App() {
       </Routes>
 
       <footer className="mx-auto max-w-6xl px-6 py-6 text-xs text-[var(--color-muted)]">
-        ControlPlane.ai — AI governance proxy console.
+        ControlPlane.ai · AI governance proxy console.
       </footer>
     </div>
   )

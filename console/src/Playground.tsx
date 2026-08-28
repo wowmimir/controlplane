@@ -26,7 +26,7 @@ function OutcomePanel({ outcome }: { outcome: Exclude<ChatResult, { kind: 'ok' }
         className="rounded-md border border-[var(--color-warning)]/40 bg-[var(--color-surface)] p-4"
       >
         <p className="text-sm font-medium text-[var(--color-warning)]">
-          Session blocked — accumulated risk
+          Session blocked: accumulated risk
         </p>
         <p className="mt-1 text-sm text-[var(--color-body)]">{outcome.message}</p>
       </div>
@@ -173,9 +173,9 @@ export function Playground() {
             <h1 className="text-xl font-medium text-[var(--color-ink)]">Playground</h1>
             <p className="mt-1 max-w-prose text-sm text-[var(--color-muted)]">
               Send prompts straight through the proxy from the browser, against {selectedName}. Every
-              message reuses the session ControlPlane hands back, so risk builds across turns like a
-              real conversation — send a violation, then a clean prompt, and watch the second one get
-              blocked on the session's accumulated risk.
+              message reuses the session ControlPlane hands back, so risk carries across turns. Send
+              a violation, then a clean prompt, and watch the second one get blocked on the session's
+              built-up risk.
             </p>
           </div>
           <button
@@ -231,7 +231,7 @@ export function Playground() {
                   {displayId(sessionId)}
                 </Link>
               ) : (
-                <span className="text-[var(--color-muted)]">— starts on first send</span>
+                <span className="text-[var(--color-muted)]">starts on first send</span>
               )}
             </span>
           </div>
@@ -264,7 +264,7 @@ export function Playground() {
                   </div>
                   {turn.blocked && (
                     <span className="mt-0.5 text-xs text-[var(--color-muted)]">
-                      blocked — not sent to the model, and not resent on the next turn
+                      blocked: not sent to the model, and not resent on the next turn
                     </span>
                   )}
                 </div>

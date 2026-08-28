@@ -254,13 +254,14 @@ export function SessionDetail() {
                     {ledgerLive ? 'This session is escalated' : 'This session was escalated'}
                   </p>
                   <p className="mt-1 text-sm text-[var(--color-muted)]">
-                    Cumulative risk or a per-category strike count crossed Fork #3's threshold.{' '}
+                    Cumulative risk or a per-category strike count crossed ControlPlane's escalation
+                    threshold.{' '}
                     {ledgerLive
                       ? 'New turns on this session block immediately.'
-                      : "The live ledger has since expired (15 minutes of inactivity) — a new turn today would start fresh."}{' '}
+                      : 'The live ledger has since expired (15 minutes of inactivity), so a new turn today would start fresh.'}{' '}
                     Escalation itself writes no execution row, so the turn that tripped it may not
-                    be one of the ones listed below — the story here is the accumulation across
-                    turns, not necessarily any single one of them.
+                    be one of the ones listed below. What matters here is the buildup across turns,
+                    not any single one.
                   </p>
                 </div>
               )

@@ -150,7 +150,7 @@ export function WorkloadForm({ open, workload, onClose, onSaved }: WorkloadFormP
 
         <p className="-mb-2 text-xs text-[var(--color-muted)]">
           Policy profile and the two budget fields below are recorded but not yet enforced by the
-          evaluation path — only fail mode changes ControlPlane's behavior today.
+          evaluation path; only fail mode changes ControlPlane's behavior today.
         </p>
 
         <div className="grid grid-cols-2 gap-4">

@@ -4,7 +4,7 @@ The operator console for ControlPlane. It reads the backend's `/api/console/*`
 endpoints and the OpenAI-shaped `/v1/chat/completions` endpoint directly from
 the browser; it has no server of its own.
 
-**Stack:** React 19 + TypeScript + Vite, Tailwind v4 (dark only, by design —
+**Stack:** React 19 + TypeScript + Vite, Tailwind v4 (dark only, by design;
 see `src/index.css`), React Router. Lint via Oxlint.
 
 ## Run it

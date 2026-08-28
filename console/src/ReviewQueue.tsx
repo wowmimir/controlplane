@@ -65,9 +65,8 @@ export function ReviewQueue() {
           <div>
             <h1 className="text-xl font-medium text-[var(--color-ink)]">Review</h1>
             <p className="mt-1 max-w-prose text-sm text-[var(--color-muted)]">
-              Every finding still waiting for an operator's verdict, newest first. Confirming or
-              rejecting a finding here feeds the Dashboard's false-positive rate and the Detection
-              Health page, so nobody has to trawl sessions one at a time.
+              Every finding still waiting for a verdict, newest first. Confirming or rejecting one
+              here feeds the Dashboard's false-positive rate and the Detection Health page.
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
